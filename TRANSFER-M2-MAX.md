@@ -160,6 +160,25 @@ done
 Expected: the M5 Pro wins with one worker (the CPU side limits a single
 process); with 2–3 workers the 38-core M2 Max may catch up. Not measured yet.
 
+## 8. Open the workspace-transfer PR (from any machine)
+
+`PR-workspace-transfer.md` next to this file is the drafted PR description
+for `feature/workspace-transfer` (Ukrainian, like the rest of the project).
+Before opening it, update its «Що не перевірено» section with the real
+Intel → M2 Max result.
+
+```sh
+git fetch -q origin && git fetch -q upstream
+git switch feature/workspace-transfer && git pull
+git merge upstream/main                      # merge, never rebase: the branch is pushed
+uv run python tools/scan_private.py --history
+git push origin feature/workspace-transfer
+gh pr create --repo SERGIUSH-UA/nyshporka --base main \
+    --head pahan35:feature/workspace-transfer \
+    --title "Перенести простір на інший комп'ютер: nysh workspace export / import" \
+    --body-file <path to PR-workspace-transfer.md>
+```
+
 ## If something goes wrong
 
 - **Not enough free space:** the dry run refuses and says how much is needed.
