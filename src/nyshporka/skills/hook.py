@@ -144,13 +144,13 @@ def install(*, user: bool) -> Path:
     return settings
 
 
-def _strip(settings: Path) -> None:
+def _strip(settings: Path) -> bool:
     if not settings.is_file():
-        return
+        return False
     data = _load(settings)
     hooks = data.get("hooks") or {}
     if not any(_ours(e) for e in (hooks.get("PreToolUse") or [])):
-        return
+        return False
     pre = [e for e in hooks["PreToolUse"] if not _ours(e)]
     if pre:
         hooks["PreToolUse"] = pre
@@ -159,6 +159,17 @@ def _strip(settings: Path) -> None:
     if not hooks:
         data.pop("hooks", None)
     _write(settings, data)
+    return True
+
+
+def unhook(settings: Path) -> bool:
+    """Зняти наш запис саме з цього конфігу; чужі записи лишаються.
+
+    Для простору, перенесеного з іншої машини (`setup.transfer`): запис там
+    несе шляхи старої машини й падав би на кожному виклику помічника. Рішення
+    людини в контрольному файлі не чіпаємо — його на цій машині ще немає.
+    """
+    return _strip(settings)
 
 
 def remove(*, user: bool) -> Path:
