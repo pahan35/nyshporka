@@ -242,6 +242,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\nysh-install.ps1"
     | o versiune anume | `-Version X.Y.Z` | prin `NYSH_SOURCE` | inclusă în fișier |
     | un singur director pentru tot | `-Workspace D:\Genealogy\Nyshporka -Home_ D:\Genealogy\Nyshporka\.program` | — | `/WORKSPACE=D:\Genealogy\Nyshporka` |
     | mutarea unei instalări existente | `nysh relocate D:\Genealogy\Nyshporka` | la fel | la fel |
+    | mutarea pe alt calculator | `nysh workspace export E:\mutare` → `nysh workspace import E:\mutare` | la fel | la fel |
     | fără întrebări | — | — | `/VERYSILENT` |
     | fără pachetul de ghiduri | `-NoCatalog` | `NYSH_NO_CATALOG=1` | — |
     | jurnal | — | — | `/LOG=setup.log` |
