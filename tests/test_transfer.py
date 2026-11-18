@@ -407,3 +407,17 @@ def test_export_progress_and_cached_trees(old, tmp_path: Path, monkeypatch) -> N
     assert old["hub"] not in scanned_paths
     assert old["ext"] not in scanned_paths
     assert any("%)" in line for line in copy_lines)
+
+
+def test_plan_export_fails_fast_when_workspace_is_locked(
+    old, tmp_path: Path, monkeypatch,
+) -> None:
+    from nyshporka.core import lock as L
+
+    with L.WorkspaceLock(old["hub"]).acquire():
+        monkeypatch.setattr(
+            T, "scan",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("scan should not run")),
+        )
+        p = T.plan_export(tmp_path / "drive" / "b")
+        assert any("простір уже відкрито" in msg for msg in p.problems)

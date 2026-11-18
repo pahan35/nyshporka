@@ -411,6 +411,7 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
                 echo: Callable[[str], None] | None = None) -> ExportPlan:
     """Порахувати експорт. Нічого не пише."""
     from nyshporka.core import appdirs
+    from nyshporka.core.lock import LockBusy, check_busy
     from nyshporka.core.workspace import workspace
     from nyshporka.setup.doctor import _ENGINE_VENV_NAMES
     from nyshporka.setup.wizard import _is_synced
@@ -435,6 +436,11 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
         else:
             p.problems.append(f"{to} не порожня — потрібна нова чи порожня тека "
                               f"або пакунок цього ж простору")
+    holder = check_busy(hub)
+    if holder is not None:
+        p.problems.append(f"{LockBusy(holder)} Закрийте вікно Нишпорки (і `nysh serve`) "
+                          f"на час експорту.")
+        return p
     if _is_synced(to):
         p.warnings.append("тека синхронізується з хмарою — пакунок поїде в мережу, "
                           "і копіювання буде повільним")
