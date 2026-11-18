@@ -1002,6 +1002,8 @@ def workspace_export(
                                    help="покласти й довідники та ваги моделей"),
     agent_memory: bool = typer.Option(True, "--agent-memory/--no-agent-memory",
                                       help="пам'ять помічника про цей простір"),
+    case: list[str] = typer.Option([], "--case",
+                                   help="лише вказана справа (шифра, ключ або тека); можна кілька"),
     dry_run: bool = typer.Option(False, "--dry-run", help="лише показати план"),
 ) -> None:
     """Покласти простір у пакунок для іншої машини (простір не змінюється).
@@ -1019,6 +1021,7 @@ def workspace_export(
                 with_roots=with_roots,
                 with_data=with_data,
                 with_memory=agent_memory,
+                cases=case or None,
                 echo=echo,
                 progress=progress,
             )
@@ -1028,6 +1031,7 @@ def workspace_export(
     console.print(f"простір:  {p.source}  [muted]{T.human(p.ws_bytes)}[/muted]")
     console.print(f"пакунок:  [bold]{p.dest}[/bold]"
                   + ("  [muted](оновлюю наявний)[/muted]" if p.refresh else "")
+                  + (f"  [muted](справи: {', '.join(p.cases)})[/muted]" if p.cases else "")
                   + (f"  [muted]{p.fs}[/muted]" if p.fs else ""))
     for r in p.roots:
         if r.inside:
@@ -1081,6 +1085,8 @@ def workspace_import(
     roots_to: str = typer.Option("", "--roots-to",
                                  help="куди класти корені справ із пакунка "
                                       "(типово `<тека>-справи` поруч із простором)"),
+    update: bool = typer.Option(False, "--update",
+                                help="долити зміни в наявний простір (не затираючи решту)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="лише показати план"),
 ) -> None:
     """Розкласти пакунок простору на цій машині й налаштувати його під неї.
@@ -1094,7 +1100,7 @@ def workspace_import(
     try:
         with _transfer_progress(muted=True) as (echo, progress):
             p = T.plan_import(bundle, target or None, roots_to or None,
-                              echo=echo, progress=progress)
+                              update=update, echo=echo, progress=progress)
     except (T.TransferError, WorkspaceError) as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
@@ -1135,9 +1141,10 @@ def workspace_import(
         console.print(f"[muted]хук git → {rep.git_hook}[/muted]")
     if rep.cases:
         console.print(f"[muted]{rep.cases}[/muted]")
-    console.print("[bold]Лишилось зробити руками:[/bold]")
-    for item in rep.todo:
-        console.print(f"  • {item}")
+    if rep.todo:
+        console.print("[bold]Лишилось зробити руками:[/bold]")
+        for item in rep.todo:
+            console.print(f"  • {item}")
 
 
 def _catalog_step(*, check: bool, skip: bool) -> None:

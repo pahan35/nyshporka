@@ -518,3 +518,57 @@ def test_run_export_reuses_verify_tree_and_parallel_mirror(
     assert copied == 12
     assert (dst / "sub0" / "f0.txt").read_text(encoding="utf-8") == "data-0"
 
+
+def test_case_scoped_export_and_incremental_import(old, new_machine, tmp_path: Path, monkeypatch) -> None:
+    hub = old["hub"]
+    # Add a second case + HTR run that should NOT be exported when --case targets the first.
+    other_case = hub / "data" / "raw" / "other_case"
+    other_case.mkdir(parents=True, exist_ok=True)
+    (other_case / "001.jpg").write_bytes(b"other-scan")
+    target_case = hub / "data" / "raw" / "in_case"
+    target_case.mkdir(parents=True, exist_ok=True)
+    (target_case / "001.jpg").write_bytes(b"in-scan")
+    target_run = hub / "reports" / "htr" / "in_case_run"
+    target_run.mkdir(parents=True, exist_ok=True)
+    (target_run / "_htr_meta.json").write_text(
+        json.dumps({"case_dir": str(target_case), "done": True}), encoding="utf-8",
+    )
+    (target_run / "001.txt").write_text("Шевченко", encoding="utf-8")
+    (hub / "data" / "cases").mkdir(parents=True, exist_ok=True)
+    (hub / "data" / "cases" / "overrides.json").write_text(
+        json.dumps({"in_case_run": {"key": "TEST/1/1/1"}}), encoding="utf-8",
+    )
+
+    bundle = tmp_path / "drive" / "case-delta"
+    ep = T.plan_export(bundle, cases=[str(target_case)])
+    assert ep.scope == "cases"
+    assert not ep.problems
+    T.run_export(ep, echo=lambda _m: None)
+
+    meta = T.read_bundle(bundle)
+    assert meta["scope"] == "cases"
+    assert any("reports/htr/in_case_run/001.txt" in k for k in meta["files"])
+    assert not any("other_case" in k for k in meta["files"])
+
+    # Prepare an existing non-empty target workspace on machine B.
+    dst_ws = new_machine["target"]
+    dst_ws.mkdir(parents=True, exist_ok=True)
+    (dst_ws / W.MARKER).write_text('name = "existing"\n', encoding="utf-8")
+    (dst_ws / "existing_note.txt").write_text("keep-me", encoding="utf-8")
+    (dst_ws / "data" / "cases").mkdir(parents=True, exist_ok=True)
+    (dst_ws / "data" / "cases" / "overrides.json").write_text(
+        json.dumps({"old_run": {"key": "OLD/1/1/1"}}), encoding="utf-8",
+    )
+
+    ip = T.plan_import(bundle, dst_ws)
+    assert ip.update is True
+    assert not ip.problems
+    monkeypatch.setattr("nyshporka.cases.db.rebuild", lambda **_k: {"cases": 1})
+    rep = T.run_import(ip, echo=lambda _m: None)
+    assert rep.todo == []
+    assert (dst_ws / "existing_note.txt").read_text(encoding="utf-8") == "keep-me"
+    assert (dst_ws / W.MARKER).read_text(encoding="utf-8") == 'name = "existing"\n'
+    assert (dst_ws / "reports" / "htr" / "in_case_run" / "001.txt").read_text(encoding="utf-8") == "Шевченко"
+    merged_ov = json.loads((dst_ws / "data" / "cases" / "overrides.json").read_text(encoding="utf-8"))
+    assert set(merged_ov) == {"old_run", "in_case_run"}
+
