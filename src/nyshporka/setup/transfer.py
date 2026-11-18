@@ -41,6 +41,7 @@ import shutil
 import sys
 import time
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +79,7 @@ _SCAN_PROGRESS_SEC = 10.0
 _COPY_PROGRESS_SEC = 15.0
 _COPY_STEP_MIN = 256 * 1024 ** 2
 _COPY_STEP_MAX = 512 * 1024 ** 2
+_COPY_WORKERS = 4
 
 _WIN_BAD_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 _WIN_RESERVED = frozenset({"con", "prn", "aux", "nul",
@@ -216,19 +218,138 @@ def _same(dst: Path, size: int, mtime: float) -> bool:
     return st.st_size == size and abs(st.st_mtime - mtime) <= _MTIME_SLACK
 
 
-def _to_copy_stats(tree: Tree, dst: Path) -> tuple[int, int]:
-    """Скільки байтів і файлів ще треба покласти в `dst`."""
-    total_bytes = total_files = 0
+def _pending_copies(tree: Tree, dst: Path) -> tuple[list[tuple[str, int]], int, int]:
+    """Зібрати список файлів для копіювання, суму байтів і кількість за один обхід."""
+    pending: list[tuple[str, int]] = []
+    total_bytes = 0
     for rel, (s, m) in tree.files.items():
         if not _same(dst / rel, s, m):
-            total_bytes += max(s, 0)
-            total_files += 1
-    return total_bytes, total_files
+            sz = max(s, 0)
+            pending.append((rel, sz))
+            total_bytes += sz
+    return pending, total_bytes, len(pending)
 
 
 def to_copy(tree: Tree, dst: Path) -> int:
     """Скільки байтів ще треба покласти в `dst` (решта там уже така сама)."""
-    return _to_copy_stats(tree, dst)[0]
+    return _pending_copies(tree, dst)[1]
+
+
+def _copy_one(src_file: Path, dst_file: Path) -> None:
+    try:
+        shutil.copy2(src_file, dst_file)
+    except FileNotFoundError:
+        # `tree.dirs` створюється заздалегідь; цей fallback лише на випадок синтетичного `Tree`.
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src_file, dst_file)
+        except OSError as exc:
+            raise TransferError(f"не вдалось скопіювати {src_file} → {dst_file}: {exc}") from None
+    except OSError as exc:
+        raise TransferError(f"не вдалось скопіювати {src_file} → {dst_file}: {exc}") from None
+
+
+def _mirror_verified(
+    src: Path, tree: Tree, dst: Path, *, prune: bool = False,
+    echo: Callable[[str], None] = print,
+    progress: Callable[[str], None] | None = None,
+    tick: Callable[[], None] | None = None,
+) -> tuple[int, int, Tree]:
+    """Покласти `tree` із `src` у `dst` і повернути `(copied, done_bytes, verify_tree)`."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for rel in tree.dirs:
+        (dst / rel).mkdir(parents=True, exist_ok=True)
+    pending, total, total_files = _pending_copies(tree, dst)
+    copied = done_bytes = 0
+    step = min(max(total // 20, _COPY_STEP_MIN), _COPY_STEP_MAX) if total > 0 else _COPY_STEP_MIN
+    shown = 0
+    report = progress or echo
+    progress_sec = _LIVE_PROGRESS_SEC if progress is not None else _COPY_PROGRESS_SEC
+    started = last_report = prev_t = time.monotonic()
+    prev_bytes = prev_files = 0
+    ema_byte_rate = ema_file_rate = 0.0
+    alpha = 0.3
+
+    def _on_copied(sz: int) -> None:
+        nonlocal copied, done_bytes, shown, last_report, prev_t, prev_bytes, prev_files
+        nonlocal ema_byte_rate, ema_file_rate
+        copied += 1
+        done_bytes += sz
+        now = time.monotonic()
+        should_report = (now - last_report >= progress_sec if progress is not None
+                         else done_bytes - shown >= step or now - last_report >= progress_sec)
+        if not should_report:
+            return
+        shown = done_bytes
+        last_report = now
+        dt = now - prev_t
+        if dt > 0.05:
+            inst_bytes = (done_bytes - prev_bytes) / dt
+            inst_files = (copied - prev_files) / dt
+            ema_byte_rate = (inst_bytes if ema_byte_rate == 0.0
+                             else alpha * inst_bytes + (1.0 - alpha) * ema_byte_rate)
+            ema_file_rate = (inst_files if ema_file_rate == 0.0
+                             else alpha * inst_files + (1.0 - alpha) * ema_file_rate)
+            prev_t = now
+            prev_bytes = done_bytes
+            prev_files = copied
+        pct = int(done_bytes * 100 / total) if total > 0 else 100
+        if now - started >= 1.0 and (total > done_bytes or total_files > copied):
+            eta_bytes = ((total - done_bytes) / ema_byte_rate
+                         if ema_byte_rate > 0 and total > done_bytes else 0.0)
+            eta_files = ((total_files - copied) / ema_file_rate
+                         if ema_file_rate > 0 and total_files > copied else 0.0)
+            eta = max(eta_bytes, eta_files)
+            report(f"    … {human(done_bytes)} з {human(total)} "
+                   f"({pct}%) · {copied}/{total_files} файлів · "
+                   f"{human(int(ema_byte_rate))}/с · ~{_format_eta(eta)}")
+        else:
+            report(f"    … {human(done_bytes)} з {human(total)} "
+                   f"({pct}%) · {copied}/{total_files} файлів")
+        if tick is not None:
+            tick()
+
+    workers = max(_COPY_WORKERS, 1)
+    if workers == 1 or len(pending) <= 1:
+        for rel, sz in pending:
+            _copy_one(src / rel, dst / rel)
+            _on_copied(sz)
+    else:
+        max_in_flight = workers * 32
+        it = iter(pending)
+        in_flight: dict[Any, int] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for rel, sz in it:
+                in_flight[pool.submit(_copy_one, src / rel, dst / rel)] = sz
+                if len(in_flight) >= max_in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        fut.result()
+                        _on_copied(in_flight.pop(fut))
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    fut.result()
+                    _on_copied(in_flight.pop(fut))
+
+    verify_tree = scan(
+        dst,
+        progress_sec=_LIVE_PROGRESS_SEC if progress is not None else None,
+        on_progress=(lambda count, _size: report(f"  … звіряю {dst.name}: {count} файлів"))
+        if progress is not None else None,
+    )
+    if prune:
+        for rel in list(verify_tree.files):
+            if rel not in tree.files:
+                (dst / rel).unlink(missing_ok=True)
+                verify_tree.files.pop(rel, None)
+    bad = diff(tree.sizes(), verify_tree.sizes())
+    if bad:
+        raise TransferError("копія не зійшлась з оригіналом:\n  " + "\n  ".join(bad[:20]))
+    same = len(tree.files) - copied
+    echo(f"  ✓ звірено {len(tree.files)} файлів: скопійовано {copied} ({human(done_bytes)})"
+         + (f", {same} вже були такі самі" if same else ""))
+    return copied, done_bytes, verify_tree
 
 
 def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
@@ -244,79 +365,9 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
     🔴 Звірка пофайлова (шлях + розмір), і розбіжність — відмова: диск, який
     мовчки обрізав файл, інакше дав би «перенесено» без половини сканів.
     """
-    dst.mkdir(parents=True, exist_ok=True)
-    for rel in tree.dirs:
-        (dst / rel).mkdir(parents=True, exist_ok=True)
-    copied = done_bytes = 0
-    total, total_files = _to_copy_stats(tree, dst)
-    step = min(max(total // 20, _COPY_STEP_MIN), _COPY_STEP_MAX) if total > 0 else _COPY_STEP_MIN
-    shown = 0
-    report = progress or echo
-    progress_sec = _LIVE_PROGRESS_SEC if progress is not None else _COPY_PROGRESS_SEC
-    started = last_report = prev_t = time.monotonic()
-    prev_bytes = prev_files = 0
-    ema_byte_rate = ema_file_rate = 0.0
-    alpha = 0.3
-    for rel, (size, mtime) in tree.files.items():
-        target = dst / rel
-        if _same(target, size, mtime):
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(src / rel, target)
-        except OSError as exc:
-            raise TransferError(f"не вдалось скопіювати {src / rel} → {target}: {exc}") from None
-        copied += 1
-        done_bytes += max(size, 0)
-        now = time.monotonic()
-        should_report = (now - last_report >= progress_sec if progress is not None
-                         else done_bytes - shown >= step or now - last_report >= progress_sec)
-        if should_report:
-            shown = done_bytes
-            last_report = now
-            dt = now - prev_t
-            if dt > 0.05:
-                inst_bytes = (done_bytes - prev_bytes) / dt
-                inst_files = (copied - prev_files) / dt
-                ema_byte_rate = (inst_bytes if ema_byte_rate == 0.0
-                                 else alpha * inst_bytes + (1.0 - alpha) * ema_byte_rate)
-                ema_file_rate = (inst_files if ema_file_rate == 0.0
-                                 else alpha * inst_files + (1.0 - alpha) * ema_file_rate)
-                prev_t = now
-                prev_bytes = done_bytes
-                prev_files = copied
-            pct = int(done_bytes * 100 / total) if total > 0 else 100
-            if now - started >= 1.0 and (total > done_bytes or total_files > copied):
-                eta_bytes = ((total - done_bytes) / ema_byte_rate
-                             if ema_byte_rate > 0 and total > done_bytes else 0.0)
-                eta_files = ((total_files - copied) / ema_file_rate
-                             if ema_file_rate > 0 and total_files > copied else 0.0)
-                eta = max(eta_bytes, eta_files)
-                report(f"    … {human(done_bytes)} з {human(total)} "
-                       f"({pct}%) · {copied}/{total_files} файлів · "
-                       f"{human(int(ema_byte_rate))}/с · ~{_format_eta(eta)}")
-            else:
-                report(f"    … {human(done_bytes)} з {human(total)} "
-                       f"({pct}%) · {copied}/{total_files} файлів")
-            if tick is not None:
-                tick()
-    if prune:
-        extra = scan(dst)
-        for rel in extra.files:
-            if rel not in tree.files:
-                (dst / rel).unlink(missing_ok=True)
-    verify_tree = scan(
-        dst,
-        progress_sec=_LIVE_PROGRESS_SEC if progress is not None else None,
-        on_progress=(lambda count, _size: report(f"  … звіряю {dst.name}: {count} файлів"))
-        if progress is not None else None,
+    copied, done_bytes, _ = _mirror_verified(
+        src, tree, dst, prune=prune, echo=echo, progress=progress, tick=tick,
     )
-    bad = diff(tree.sizes(), verify_tree.sizes())
-    if bad:
-        raise TransferError("копія не зійшлась з оригіналом:\n  " + "\n  ".join(bad[:20]))
-    same = len(tree.files) - copied
-    echo(f"  ✓ звірено {len(tree.files)} файлів: скопійовано {copied} ({human(done_bytes)})"
-         + (f", {same} вже були такі самі" if same else ""))
     return copied, done_bytes
 
 
@@ -580,11 +631,14 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print,
     # Спершу прибираємо опис: доки експорт не дійшов до кінця, пакунок неповний.
     (to / BUNDLE).unlink(missing_ok=True)
     _write_json(to / PARTIAL, {"source": source})
+    verified: dict[str, Tree] = {}
     with lock:
         echo("1. простір")
         ws_tree = p.trees.get(WS_DIR) or scan(p.source, top=_skip_top)
-        mirror(p.source, ws_tree, to / WS_DIR, prune=True,
-               echo=echo, progress=progress, tick=lock.beat)
+        _, _, verified[WS_DIR] = _mirror_verified(
+            p.source, ws_tree, to / WS_DIR, prune=True,
+            echo=echo, progress=progress, tick=lock.beat,
+        )
     slots = {r.slot for r in p.roots if r.slot}
     if any(r.slot for r in p.roots):
         echo("2. корені справ поза простором")
@@ -592,7 +646,9 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print,
         if r.slot:
             echo(f"  {r.path} → {r.slot}")
             rt = p.trees.get(r.slot) or scan(Path(r.path))
-            mirror(Path(r.path), rt, to / r.slot, prune=True, echo=echo, progress=progress)
+            _, _, verified[r.slot] = _mirror_verified(
+                Path(r.path), rt, to / r.slot, prune=True, echo=echo, progress=progress,
+            )
     # Корінь, якого цього разу не клали, не має лишатись у пакунку зі старого разу.
     if (to / ROOTS_DIR).is_dir():
         for old in (to / ROOTS_DIR).iterdir():
@@ -601,19 +657,26 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print,
     if p.data:
         echo("3. довідники й ваги")
     for name, src in p.data.items():
-        dt = p.trees.get(f"{DATA_DIR}/{name}") or scan(src)
-        mirror(src, dt, to / DATA_DIR / name, prune=True, echo=echo, progress=progress)
+        sec = f"{DATA_DIR}/{name}"
+        dt = p.trees.get(sec) or scan(src)
+        _, _, verified[sec] = _mirror_verified(
+            src, dt, to / sec, prune=True, echo=echo, progress=progress,
+        )
     if p.memory:
         echo("4. пам'ять помічника")
     for key, src in p.memory.items():
-        mt = p.trees.get(f"{MEMORY_DIR}/{key}") or scan(src)
-        mirror(src, mt, to / MEMORY_DIR / key, prune=True, echo=echo, progress=progress)
+        sec = f"{MEMORY_DIR}/{key}"
+        mt = p.trees.get(sec) or scan(src)
+        _, _, verified[sec] = _mirror_verified(
+            src, mt, to / sec, prune=True, echo=echo, progress=progress,
+        )
 
     sections = [WS_DIR, *sorted(slots), *(f"{DATA_DIR}/{n}" for n in p.data),
                 *(f"{MEMORY_DIR}/{k}" for k in p.memory)]
     files: dict[str, int] = {}
     for sec in sections:
-        for rel, size in scan(to / sec).sizes().items():
+        vt = verified.get(sec) or scan(to / sec)
+        for rel, size in vt.sizes().items():
             files[f"{sec}/{rel}"] = size
     meta = {
         "format": FORMAT, "nysh_version": __version__,
