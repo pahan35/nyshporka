@@ -995,8 +995,13 @@ def workspace_export(
     from nyshporka.setup import transfer as T
 
     try:
-        p = T.plan_export(dest, with_roots=with_roots, with_data=with_data,
-                          with_memory=agent_memory)
+        p = T.plan_export(
+            dest,
+            with_roots=with_roots,
+            with_data=with_data,
+            with_memory=agent_memory,
+            echo=lambda msg: console.print(f"[muted]{msg}[/muted]"),
+        )
     except WorkspaceError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
