@@ -458,6 +458,9 @@ class ExportPlan:
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     trees: dict[str, Tree] = field(default_factory=dict, repr=False)
+    scope: str = "full"
+    cases: list[str] = field(default_factory=list)
+    slices: list[tuple[Path, str, str]] = field(default_factory=list, repr=False)
 
 
 def _slot_name(i: int, path: str) -> str:
@@ -504,8 +507,71 @@ def _existing_bundle(dest: Path) -> dict[str, Any]:
     return {}
 
 
+def _resolve_case_for_export(hub: Path, spec: str) -> tuple[Path, list[Path], str]:
+    """Знайти теку справи та її HTR-прогони для `--case`."""
+    from nyshporka.cases import db
+    from nyshporka.core.workspace import WorkspaceError
+
+    raw = spec.strip()
+    if not raw:
+        raise WorkspaceError("порожній ідентифікатор справи для --case")
+    # 1. Прямий шлях на диску.
+    cand = Path(raw).expanduser()
+    if not cand.is_absolute():
+        cand = hub / cand
+    if cand.is_dir():
+        case_dir = Path(os.path.abspath(cand))
+        runs = _runs_for_case_dir(hub, case_dir)
+        return case_dir, runs, case_dir.name
+
+    # 2. Пошук у реєстрі справ за ключем, шифрою або підрядком.
+    try:
+        rows = db.query(q=raw, limit=50)
+    except Exception:
+        rows = []
+    exact = [r for r in rows if raw in (str(r.get("key") or ""), str(r.get("shifra") or ""))]
+    picked = exact if exact else rows
+    if not picked:
+        raise WorkspaceError(f"справу «{spec}» не знайдено")
+    if len(picked) > 1:
+        opts = ", ".join(f"{r.get('shifra') or r.get('key')} ({r.get('key')})" for r in picked[:5])
+        raise WorkspaceError(f"під «{spec}» підпадає кілька справ: {opts}")
+    row = picked[0]
+    p_str = str(row.get("path") or "")
+    case_dir = Path(os.path.abspath(Path(p_str) if Path(p_str).is_absolute() else hub / p_str))
+    if not case_dir.is_dir():
+        raise WorkspaceError(f"тека справи «{spec}» відсутня: {case_dir}")
+    runs = [hub / "reports" / "htr" / str(r) for r in (row.get("htr_runs") or [])
+            if (hub / "reports" / "htr" / str(r)).is_dir()]
+    if not runs:
+        runs = _runs_for_case_dir(hub, case_dir)
+    label = str(row.get("shifra") or row.get("key") or case_dir.name)
+    return case_dir, runs, label
+
+
+def _runs_for_case_dir(hub: Path, case_dir: Path) -> list[Path]:
+    htr_root = hub / "reports" / "htr"
+    if not htr_root.is_dir():
+        return []
+    norm = os.path.normcase(os.path.abspath(case_dir))
+    out: list[Path] = []
+    for d in sorted(htr_root.iterdir()):
+        meta_file = d / "_htr_meta.json"
+        if not d.is_dir() or not meta_file.is_file():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        cdir = str(meta.get("case_dir") or "")
+        if cdir and os.path.normcase(os.path.abspath(cdir)) == norm:
+            out.append(d)
+    return out
+
+
 def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool = False,
                 with_memory: bool = True,
+                cases: list[str] | None = None,
                 echo: Callable[[str], None] | None = None,
                 progress: Callable[[str], None] | None = None) -> ExportPlan:
     """Порахувати експорт. Нічого не пише."""
@@ -544,48 +610,88 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
         p.warnings.append("тека синхронізується з хмарою — пакунок поїде в мережу, "
                           "і копіювання буде повільним")
 
-    tree = _scan_section(hub, label=f"простір ({hub})", echo=echo, progress=progress,
-                         top=_skip_top)
-    p.trees[WS_DIR] = tree
-    p.links = [f"{WS_DIR}/{x}" for x in tree.links]
-    p.ws_bytes = tree.bytes
-    p.copy_bytes = to_copy(tree, to / WS_DIR)
-    big = [rel for rel, (s, _) in tree.files.items() if s > _FAT_LIMIT]
-    bad_names = [rel for rel in tree.files if win_bad_name(rel)]
+    big: list[str] = []
+    bad_names: list[str] = []
+    if cases:
+        p.scope = "cases"
+        seen_rel: set[str] = set()
+        ext_idx = 0
+        for spec in cases:
+            case_dir, runs, label = _resolve_case_for_export(hub, spec)
+            p.cases.append(label)
+            if _inside(case_dir, hub):
+                rel = case_dir.relative_to(hub).as_posix()
+                dst_rel = f"{WS_DIR}/{rel}"
+                if dst_rel not in seen_rel:
+                    seen_rel.add(dst_rel)
+                    p.slices.append((case_dir, dst_rel, f"справа ({label})"))
+            else:
+                ext_idx += 1
+                slot = _slot_name(ext_idx, str(case_dir))
+                r = Root(path=str(case_dir), slot=slot)
+                p.roots.append(r)
+                if slot not in seen_rel:
+                    seen_rel.add(slot)
+                    p.slices.append((case_dir, slot, f"корінь ({label})"))
+            for rdir in runs:
+                dst_rel = f"{WS_DIR}/reports/htr/{rdir.name}"
+                if dst_rel not in seen_rel:
+                    seen_rel.add(dst_rel)
+                    p.slices.append((rdir, dst_rel, f"прогін ({rdir.name})"))
+        ov_dir = hub / "data" / "cases"
+        if (ov_dir / "overrides.json").is_file() and f"{WS_DIR}/data/cases" not in seen_rel:
+            p.slices.append((ov_dir, f"{WS_DIR}/data/cases", "прив'язки справ"))
+        for src_dir, dst_rel, label in p.slices:
+            st = _scan_section(src_dir, label=label, echo=echo, progress=progress)
+            p.trees[dst_rel] = st
+            p.ws_bytes += st.bytes
+            p.copy_bytes += to_copy(st, to / dst_rel)
+            p.links += [f"{dst_rel}/{x}" for x in st.links]
+            big += [f"{dst_rel}/{rel}" for rel, (s, _) in st.files.items() if s > _FAT_LIMIT]
+            bad_names += [f"{dst_rel}/{rel}" for rel in st.files if win_bad_name(rel)]
+    else:
+        tree = _scan_section(hub, label=f"простір ({hub})", echo=echo, progress=progress,
+                             top=_skip_top)
+        p.trees[WS_DIR] = tree
+        p.links = [f"{WS_DIR}/{x}" for x in tree.links]
+        p.ws_bytes = tree.bytes
+        p.copy_bytes = to_copy(tree, to / WS_DIR)
+        big = [rel for rel, (s, _) in tree.files.items() if s > _FAT_LIMIT]
+        bad_names = [rel for rel in tree.files if win_bad_name(rel)]
 
-    i = 0
-    for raw in ws.extra_case_roots:
-        r = Root(path=str(raw))
-        if _inside(Path(raw), hub):
-            r.inside = Path(os.path.abspath(raw)).relative_to(hub).as_posix()
-        elif not Path(raw).is_dir():
-            r.exists = False
-        elif with_roots:
-            i += 1
-            r.slot = _slot_name(i, str(raw))
-            rt = _scan_section(Path(raw), label=f"корінь ({raw})", echo=echo, progress=progress)
-            p.trees[r.slot] = rt
-            r.bytes = rt.bytes
-            p.copy_bytes += to_copy(rt, to / r.slot)
-            p.links += [f"{r.slot}/{x}" for x in rt.links]
-            big += [f"{raw}/{rel}" for rel, (s, _) in rt.files.items() if s > _FAT_LIMIT]
-            bad_names += [f"{raw}/{rel}" for rel in rt.files if win_bad_name(rel)]
-        p.roots.append(r)
+        i = 0
+        for raw in ws.extra_case_roots:
+            r = Root(path=str(raw))
+            if _inside(Path(raw), hub):
+                r.inside = Path(os.path.abspath(raw)).relative_to(hub).as_posix()
+            elif not Path(raw).is_dir():
+                r.exists = False
+            elif with_roots:
+                i += 1
+                r.slot = _slot_name(i, str(raw))
+                rt = _scan_section(Path(raw), label=f"корінь ({raw})", echo=echo, progress=progress)
+                p.trees[r.slot] = rt
+                r.bytes = rt.bytes
+                p.copy_bytes += to_copy(rt, to / r.slot)
+                p.links += [f"{r.slot}/{x}" for x in rt.links]
+                big += [f"{raw}/{rel}" for rel, (s, _) in rt.files.items() if s > _FAT_LIMIT]
+                bad_names += [f"{raw}/{rel}" for rel in rt.files if win_bad_name(rel)]
+            p.roots.append(r)
 
-    if with_data:
-        for name, src in (("catalog", appdirs.data_dir() / "catalog"),
-                          ("cache", appdirs.cache_dir())):
-            if src.is_dir():
-                p.data[name] = src
-                dt = _scan_section(src, label=f"дані ({name})", echo=echo, progress=progress)
-                p.trees[f"{DATA_DIR}/{name}"] = dt
-                p.copy_bytes += to_copy(dt, to / DATA_DIR / name)
-    if with_memory:
-        p.memory = _memory_dirs(hub)
-        for key, src in p.memory.items():
-            mt = _scan_section(src, label=f"пам'ять ({key})", echo=echo, progress=progress)
-            p.trees[f"{MEMORY_DIR}/{key}"] = mt
-            p.copy_bytes += to_copy(mt, to / MEMORY_DIR / key)
+        if with_data:
+            for name, src in (("catalog", appdirs.data_dir() / "catalog"),
+                              ("cache", appdirs.cache_dir())):
+                if src.is_dir():
+                    p.data[name] = src
+                    dt = _scan_section(src, label=f"дані ({name})", echo=echo, progress=progress)
+                    p.trees[f"{DATA_DIR}/{name}"] = dt
+                    p.copy_bytes += to_copy(dt, to / DATA_DIR / name)
+        if with_memory:
+            p.memory = _memory_dirs(hub)
+            for key, src in p.memory.items():
+                mt = _scan_section(src, label=f"пам'ять ({key})", echo=echo, progress=progress)
+                p.trees[f"{MEMORY_DIR}/{key}"] = mt
+                p.copy_bytes += to_copy(mt, to / MEMORY_DIR / key)
 
     p.fs = fs_type(to)
     if big and p.fs in _FAT:
@@ -632,55 +738,70 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print,
     (to / BUNDLE).unlink(missing_ok=True)
     _write_json(to / PARTIAL, {"source": source})
     verified: dict[str, Tree] = {}
-    with lock:
-        echo("1. простір")
-        ws_tree = p.trees.get(WS_DIR) or scan(p.source, top=_skip_top)
-        _, _, verified[WS_DIR] = _mirror_verified(
-            p.source, ws_tree, to / WS_DIR, prune=True,
-            echo=echo, progress=progress, tick=lock.beat,
-        )
-    slots = {r.slot for r in p.roots if r.slot}
-    if any(r.slot for r in p.roots):
-        echo("2. корені справ поза простором")
-    for r in p.roots:
-        if r.slot:
-            echo(f"  {r.path} → {r.slot}")
-            rt = p.trees.get(r.slot) or scan(Path(r.path))
-            _, _, verified[r.slot] = _mirror_verified(
-                Path(r.path), rt, to / r.slot, prune=True, echo=echo, progress=progress,
-            )
-    # Корінь, якого цього разу не клали, не має лишатись у пакунку зі старого разу.
-    if (to / ROOTS_DIR).is_dir():
-        for old in (to / ROOTS_DIR).iterdir():
-            if f"{ROOTS_DIR}/{old.name}" not in slots and old.is_dir():
-                shutil.rmtree(old)
-    if p.data:
-        echo("3. довідники й ваги")
-    for name, src in p.data.items():
-        sec = f"{DATA_DIR}/{name}"
-        dt = p.trees.get(sec) or scan(src)
-        _, _, verified[sec] = _mirror_verified(
-            src, dt, to / sec, prune=True, echo=echo, progress=progress,
-        )
-    if p.memory:
-        echo("4. пам'ять помічника")
-    for key, src in p.memory.items():
-        sec = f"{MEMORY_DIR}/{key}"
-        mt = p.trees.get(sec) or scan(src)
-        _, _, verified[sec] = _mirror_verified(
-            src, mt, to / sec, prune=True, echo=echo, progress=progress,
-        )
-
-    sections = [WS_DIR, *sorted(slots), *(f"{DATA_DIR}/{n}" for n in p.data),
-                *(f"{MEMORY_DIR}/{k}" for k in p.memory)]
     files: dict[str, int] = {}
-    for sec in sections:
-        vt = verified.get(sec) or scan(to / sec)
-        for rel, size in vt.sizes().items():
-            files[f"{sec}/{rel}"] = size
+    if p.scope == "cases":
+        with lock:
+            for src_dir, dst_rel, label in p.slices:
+                echo(label)
+                st = p.trees.get(dst_rel) or scan(src_dir)
+                _, _, verified[dst_rel] = _mirror_verified(
+                    src_dir, st, to / dst_rel, prune=True,
+                    echo=echo, progress=progress, tick=lock.beat,
+                )
+        for _src_dir, dst_rel, _label in p.slices:
+            vt = verified.get(dst_rel) or scan(to / dst_rel)
+            for rel, size in vt.sizes().items():
+                files[f"{dst_rel}/{rel}"] = size
+    else:
+        with lock:
+            echo("1. простір")
+            ws_tree = p.trees.get(WS_DIR) or scan(p.source, top=_skip_top)
+            _, _, verified[WS_DIR] = _mirror_verified(
+                p.source, ws_tree, to / WS_DIR, prune=True,
+                echo=echo, progress=progress, tick=lock.beat,
+            )
+        slots = {r.slot for r in p.roots if r.slot}
+        if any(r.slot for r in p.roots):
+            echo("2. корені справ поза простором")
+        for r in p.roots:
+            if r.slot:
+                echo(f"  {r.path} → {r.slot}")
+                rt = p.trees.get(r.slot) or scan(Path(r.path))
+                _, _, verified[r.slot] = _mirror_verified(
+                    Path(r.path), rt, to / r.slot, prune=True, echo=echo, progress=progress,
+                )
+        # Корінь, якого цього разу не клали, не має лишатись у пакунку зі старого разу.
+        if (to / ROOTS_DIR).is_dir():
+            for old in (to / ROOTS_DIR).iterdir():
+                if f"{ROOTS_DIR}/{old.name}" not in slots and old.is_dir():
+                    shutil.rmtree(old)
+        if p.data:
+            echo("3. довідники й ваги")
+        for name, src in p.data.items():
+            sec = f"{DATA_DIR}/{name}"
+            dt = p.trees.get(sec) or scan(src)
+            _, _, verified[sec] = _mirror_verified(
+                src, dt, to / sec, prune=True, echo=echo, progress=progress,
+            )
+        if p.memory:
+            echo("4. пам'ять помічника")
+        for key, src in p.memory.items():
+            sec = f"{MEMORY_DIR}/{key}"
+            mt = p.trees.get(sec) or scan(src)
+            _, _, verified[sec] = _mirror_verified(
+                src, mt, to / sec, prune=True, echo=echo, progress=progress,
+            )
+
+        sections = [WS_DIR, *sorted(slots), *(f"{DATA_DIR}/{n}" for n in p.data),
+                    *(f"{MEMORY_DIR}/{k}" for k in p.memory)]
+        for sec in sections:
+            vt = verified.get(sec) or scan(to / sec)
+            for rel, size in vt.sizes().items():
+                files[f"{sec}/{rel}"] = size
     meta = {
         "format": FORMAT, "nysh_version": __version__,
         "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "scope": p.scope, "cases": p.cases,
         "source": source,
         "workspace": {"name": p.name, "preset": p.preset, "engines": p.engines},
         "roots": [{"path": r.path, "inside": r.inside, "slot": r.slot, "bytes": r.bytes}
@@ -702,6 +823,8 @@ class ImportPlan:
     meta: dict[str, Any] = field(default_factory=dict)
     #: Ціль — порожній кістяк від `nysh init` (інсталятор): відсунемо його вбік.
     skeleton: bool = False
+    #: Доливання змін у наявний простір (не затираючи решту).
+    update: bool = False
     need_bytes: int = 0
     free_bytes: int = -1
     problems: list[str] = field(default_factory=list)
@@ -749,24 +872,34 @@ def _skeleton(target: Path) -> bool:
 
 def plan_import(bundle: str | Path, target: str | Path | None = None,
                 roots_to: str | Path | None = None,
-                *, echo: Callable[[str], None] | None = None,
+                *, update: bool = False,
+                echo: Callable[[str], None] | None = None,
                 progress: Callable[[str], None] | None = None) -> ImportPlan:
     """Порахувати імпорт. Нічого не пише."""
     from nyshporka import __version__
-    from nyshporka.core.workspace import validate_root
+    from nyshporka.core.lock import LockBusy, check_busy
+    from nyshporka.core.workspace import WorkspaceError, validate_root, workspace
     from nyshporka.migrate import version_key
     from nyshporka.setup.wizard import _is_synced, default_root
 
     src = Path(os.path.abspath(Path(bundle).expanduser()))
     meta = read_bundle(src)
+    is_update = bool(update or meta.get("scope") == "cases")
     source_ws = str((meta.get("source") or {}).get("workspace") or "")
     leaf = re.split(r"[\\/]", source_ws.rstrip("\\/"))[-1] if source_ws else ""
-    # Типово — поруч із документами, під іменем теки на старій машині.
-    to = validate_root(Path(target) if target
-                       else default_root().parent / (leaf or default_root().name))
+    if target:
+        to = validate_root(Path(target))
+    elif is_update:
+        try:
+            to = Path(os.path.abspath(workspace().hub))
+        except WorkspaceError:
+            to = validate_root(default_root().parent / (leaf or default_root().name))
+    else:
+        # Типово — поруч із документами, під іменем теки на старій машині.
+        to = validate_root(default_root().parent / (leaf or default_root().name))
     rt = (Path(os.path.abspath(Path(roots_to).expanduser())) if roots_to
           else to.parent / f"{to.name}-справи")
-    p = ImportPlan(bundle=src, target=to, roots_to=rt, meta=meta)
+    p = ImportPlan(bundle=src, target=to, roots_to=rt, meta=meta, update=is_update)
 
     if int(meta.get("format") or 0) > FORMAT:
         p.problems.append(f"пакунок нового формату ({meta.get('format')}) — оновіть "
@@ -792,6 +925,12 @@ def plan_import(bundle: str | Path, target: str | Path | None = None,
         p.problems.append("простір не може лежати в пакунку чи містити його")
     elif to.exists() and not to.is_dir():
         p.problems.append(f"{to} — файл, а потрібна тека")
+    elif is_update:
+        if to.is_dir():
+            holder = check_busy(to)
+            if holder is not None:
+                p.problems.append(f"{LockBusy(holder)} Закрийте вікно Нишпорки (і `nysh serve`) "
+                                  f"на час оновлення.")
     elif to.is_dir() and any(to.iterdir()):
         if _skeleton(to):
             p.skeleton = True
@@ -799,7 +938,8 @@ def plan_import(bundle: str | Path, target: str | Path | None = None,
                               f"відсунуто вбік, а не видалено")
         else:
             p.problems.append(f"{to} не порожня — назвіть нову теку: "
-                              f"`nysh workspace import {src} <тека>`")
+                              f"`nysh workspace import {src} <тека>` "
+                              f"(або `--update`, щоб долити зміни)")
     if _is_synced(to):
         p.problems.append(f"{to} синхронізується з хмарою — оберіть теку поза нею")
     if sys.platform == "win32":
@@ -948,13 +1088,41 @@ def _subtree(tree: Tree, sub: str) -> Tree:
     )
 
 
+def _merge_overrides(src_file: Path, dst_file: Path) -> None:
+    if not src_file.is_file():
+        return
+    try:
+        incoming = json.loads(src_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(incoming, dict):
+        return
+    existing: dict[str, Any] = {}
+    if dst_file.is_file():
+        try:
+            loaded = json.loads(dst_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            pass
+    merged = {**existing, **incoming}
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(dst_file, merged)
+
+
+def _skip_update_rel(rel: str, marker: str) -> bool:
+    if rel == marker or rel.startswith(".venv") or rel == "data/cases/overrides.json":
+        return True
+    return rel.startswith("data/derived/") and ".sqlite" in rel
+
+
 def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
                progress: Callable[[str], None] | None = None,
                build_cases: bool = True) -> ImportReport:
     """Розкласти пакунок на цій машині. Пакунок не змінюється."""
     from nyshporka.core import appdirs
     from nyshporka.core.lock import LockBusy, WorkspaceLock
-    from nyshporka.core.workspace import MARKER, remember, use
+    from nyshporka.core.workspace import MARKER, add_case_root, remember, use
     from nyshporka.project import memory_dir
 
     if p.problems:
@@ -981,7 +1149,17 @@ def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
         return scan(src / section)
 
     echo("1. простір")
-    mirror(src / WS_DIR, tree_of(WS_DIR), to, echo=echo, progress=progress)
+    ws_tree = tree_of(WS_DIR)
+    if p.update:
+        ws_tree = Tree(
+            dirs=ws_tree.dirs,
+            files={k: v for k, v in ws_tree.files.items() if not _skip_update_rel(k, MARKER)},
+            links=ws_tree.links,
+        )
+    mirror(src / WS_DIR, ws_tree, to, echo=echo, progress=progress)
+    if p.update:
+        _merge_overrides(src / WS_DIR / "data" / "cases" / "overrides.json",
+                         to / "data" / "cases" / "overrides.json")
 
     moves: dict[str, Path] = {}
     for r in p.roots:
@@ -998,7 +1176,8 @@ def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
             rep.roots_moved[old] = dest
         elif old:
             rep.roots_missing.append(old)
-    rewrite_roots(to / MARKER, moves)
+    if not p.update:
+        rewrite_roots(to / MARKER, moves)
 
     data_items = list(meta.get("data") or [])
     if data_items:
@@ -1024,9 +1203,14 @@ def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
                echo=echo, progress=progress)
         rep.memory[key] = str(dest)
 
-    rep.git_hook = _fix_git_hook(to)
-    rep.agent_files = _fix_agent_files(to)
+    if not p.update:
+        rep.git_hook = _fix_git_hook(to)
+        rep.agent_files = _fix_agent_files(to)
     remember(use(to))
+    if p.update:
+        for dest in rep.roots_moved.values():
+            with contextlib.suppress(Exception):
+                add_case_root(dest)
     if build_cases:
         echo("5. реєстр справ")
         try:
@@ -1035,9 +1219,14 @@ def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
 
             res = db.rebuild(rescan=True)
             rep.cases = f"реєстр: {cases(int(res.get('cases', 0)))}"
+            if p.update:
+                with contextlib.suppress(Exception):
+                    from nyshporka.search import text as ST
+
+                    ST.index()
         except Exception as exc:
             rep.cases = f"реєстр не зібрано ({exc}) — `nysh cases build`"
-    rep.todo = checklist(meta, rep)
+    rep.todo = [] if p.update else checklist(meta, rep)
     return rep
 
 
