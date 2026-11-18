@@ -526,7 +526,10 @@ def _resolve_case_for_export(hub: Path, spec: str) -> tuple[Path, list[Path], st
 
     # 2. Пошук у реєстрі справ за ключем, шифрою або підрядком.
     try:
-        rows = db.query(q=raw, limit=50)
+        rows = db.query_rows(q=raw, limit=50)
+        if not rows:
+            rows = [r for r in db.query_rows()
+                    if raw in (str(r.get("key") or ""), str(r.get("shifra") or ""))]
     except Exception:
         rows = []
     exact = [r for r in rows if raw in (str(r.get("key") or ""), str(r.get("shifra") or ""))]
