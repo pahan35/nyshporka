@@ -26,13 +26,26 @@ again. Then on the other machines: `git pull`.
 
 ## 1. Intel laptop: export to the external drive
 
-1. **Format the drive as APFS.** Both machines are Macs, so APFS keeps every
-   file name and timestamp. exFAT refuses names containing `:`, and FAT32
-   refuses files over 4 GB; the export checks both and stops with a message.
+1. **Prepare an APFS destination (without wiping an exFAT drive).** Both machines
+   are Macs, so APFS keeps every file name and timestamp and handles hundreds of
+   thousands of small HTR files much faster than exFAT. Check the drive format:
 
    ```sh
    diskutil info "/Volumes/<drive>" | grep Personality
    ```
+
+   - If it is already **APFS**, export directly to `/Volumes/<drive>/Нишпорка-перенос`.
+   - If it is **exFAT** with existing data you don't want to format, create an
+     APFS `.sparsebundle` on the drive (existing files stay untouched, and the
+     bundle only uses space for what is written):
+
+     ```sh
+     hdiutil create -size 50g -type SPARSEBUNDLE -fs APFS -volname "NyshTransfer" \
+         "/Volumes/<drive>/NyshTransfer.sparsebundle"
+     hdiutil attach "/Volumes/<drive>/NyshTransfer.sparsebundle"
+     ```
+
+     Then export to `/Volumes/NyshTransfer/Нишпорка-перенос`.
 
 2. **Close Nyshporka.** Quit the browser window, and stop `nysh serve` if it is
    running in a terminal (`pgrep -fl "nysh serve"` shows it). The export
@@ -58,7 +71,7 @@ again. Then on the other machines: `git pull`.
 
    ```sh
    "$UV" run nysh --workspace "<workspace path>" workspace export \
-       "/Volumes/<drive>/Нишпорка-перенос" --with-roots --with-data --dry-run
+       "/Volumes/NyshTransfer/Нишпорка-перенос" --with-roots --with-data --dry-run
    ```
 
    Check in the output:
@@ -72,7 +85,12 @@ again. Then on the other machines: `git pull`.
    `✅ пакунок готовий`. If it gets interrupted, run it again: it copies only
    what is missing, and an unfinished bundle can't be imported by mistake.
 
-7. **Eject the drive:** `diskutil eject "/Volumes/<drive>"`
+7. **Detach the sparsebundle (if used) and eject the drive:**
+
+   ```sh
+   hdiutil detach /Volumes/NyshTransfer   # only if using NyshTransfer.sparsebundle
+   diskutil eject "/Volumes/<drive>"
+   ```
 
 ## 2. M2 Max: set up the environment
 
@@ -90,9 +108,11 @@ the import moves its empty workspace aside instead of failing.
 
 ## 3. M2 Max: import from the drive
 
+If you used a sparsebundle, attach it first (`hdiutil attach "/Volumes/<drive>/NyshTransfer.sparsebundle"`), then import:
+
 ```sh
-uv run nysh workspace import "/Volumes/<drive>/Нишпорка-перенос" --dry-run
-uv run nysh workspace import "/Volumes/<drive>/Нишпорка-перенос"
+uv run nysh workspace import "/Volumes/NyshTransfer/Нишпорка-перенос" --dry-run
+uv run nysh workspace import "/Volumes/NyshTransfer/Нишпорка-перенос"
 ```
 
 - **Where things land:** the workspace goes to `~/Documents/<old folder name>`,
