@@ -421,3 +421,40 @@ def test_plan_export_fails_fast_when_workspace_is_locked(
         )
         p = T.plan_export(tmp_path / "drive" / "b")
         assert any("простір уже відкрито" in msg for msg in p.problems)
+
+
+def test_import_progress_and_cached_trees(old, new_machine, tmp_path: Path, monkeypatch) -> None:
+    bundle = tmp_path / "drive" / "bundle"
+    ep = T.plan_export(bundle, with_roots=True, with_data=True)
+    T.run_export(ep, echo=lambda _m: None)
+
+    plan_lines: list[str] = []
+    plan_prog: list[str] = []
+    ip = T.plan_import(
+        bundle,
+        new_machine["target"],
+        echo=plan_lines.append,
+        progress=plan_prog.append,
+    )
+    assert any(line.startswith("сканую пакунок") for line in plan_lines)
+    assert T.WS_DIR in ip.trees
+    assert T.ROOTS_DIR in ip.trees
+
+    # `run_import` reuses cached `ip.trees` (including sliced subtrees for `roots/...`)
+    # instead of re-scanning the bundle, and routes live ticks to `progress`.
+    import_lines: list[str] = []
+    import_prog: list[str] = []
+    monkeypatch.setattr(T, "_LIVE_PROGRESS_SEC", 0.0)
+    orig_scan = T.scan
+    scanned_paths: list[Path] = []
+
+    def tracking_scan(root: Path, **kw):
+        scanned_paths.append(root)
+        return orig_scan(root, **kw)
+
+    monkeypatch.setattr(T, "scan", tracking_scan)
+    T.run_import(ip, echo=import_lines.append, progress=import_prog.append, build_cases=False)
+    assert not any(bundle in p.parents or p == bundle for p in scanned_paths)
+    assert any("%)" in line for line in import_prog)
+    assert not any("%)" in line for line in import_lines)
+

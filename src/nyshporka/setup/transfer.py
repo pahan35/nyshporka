@@ -73,10 +73,11 @@ _FAT_LIMIT = 4 * 1024 ** 3 - 1
 #: Різниця часу зміни, яку ще вважаємо «тим самим файлом»: FAT/exFAT
 #: зберігають час із кроком до 2 с.
 _MTIME_SLACK = 2.0
-_SCAN_PROGRESS_SEC = 1.5
-_COPY_PROGRESS_SEC = 2.0
-_COPY_STEP_MIN = 32 * 1024 ** 2
-_COPY_STEP_MAX = 100 * 1024 ** 2
+_LIVE_PROGRESS_SEC = 0.5
+_SCAN_PROGRESS_SEC = 10.0
+_COPY_PROGRESS_SEC = 15.0
+_COPY_STEP_MIN = 256 * 1024 ** 2
+_COPY_STEP_MAX = 512 * 1024 ** 2
 
 _WIN_BAD_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 _WIN_RESERVED = frozenset({"con", "prn", "aux", "nul",
@@ -125,7 +126,8 @@ def _skip_top(name: str) -> bool:
 
 def scan(root: Path, *, top: Callable[[str], bool] | None = None,
          skip: Callable[[str], bool] | None = None,
-         on_progress: Callable[[int, int], None] | None = None) -> Tree:
+         on_progress: Callable[[int, int], None] | None = None,
+         progress_sec: float | None = None) -> Tree:
     """Обійти `root`, не заходячи в посилання.
 
     `top` відсіює імена лише в корені, `skip` — відносні шляхи будь-де.
@@ -134,6 +136,7 @@ def scan(root: Path, *, top: Callable[[str], bool] | None = None,
     if not root.is_dir():
         return out
     total_bytes = 0
+    interval = _SCAN_PROGRESS_SEC if progress_sec is None else progress_sec
     last_report = time.monotonic()
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
@@ -168,14 +171,14 @@ def scan(root: Path, *, top: Callable[[str], bool] | None = None,
                 out.files[rel] = (-1, 0.0)
             if on_progress is not None and (len(out.files) & 255) == 0:
                 now = time.monotonic()
-                if now - last_report >= _SCAN_PROGRESS_SEC:
+                if now - last_report >= interval:
                     last_report = now
                     on_progress(len(out.files), total_bytes)
     return out
 
 
 def _format_eta(seconds: float) -> str:
-    sec = max(int(round(seconds)), 0)
+    sec = max(round(seconds), 0)
     if sec < 60:
         return f"{sec}с"
     minutes, sec = divmod(sec, 60)
@@ -186,17 +189,22 @@ def _format_eta(seconds: float) -> str:
 
 
 def _scan_section(root: Path, *, label: str, echo: Callable[[str], None] | None = None,
+                  progress: Callable[[str], None] | None = None,
                   top: Callable[[str], bool] | None = None,
                   skip: Callable[[str], bool] | None = None) -> Tree:
     """Просканувати розділ, показуючи перебіг для великих тек."""
-    if echo is None:
+    if echo is None and progress is None:
         return scan(root, top=top, skip=skip)
-    echo(f"сканую {label}…")
+    if echo is not None:
+        echo(f"сканую {label}…")
+    report = progress or echo
+    assert report is not None
     return scan(
         root,
         top=top,
         skip=skip,
-        on_progress=lambda count, size: echo(f"  … {count} файлів ({human(size)})"),
+        progress_sec=_LIVE_PROGRESS_SEC if progress is not None else None,
+        on_progress=lambda count, size: report(f"  … {label}: {count} файлів ({human(size)})"),
     )
 
 
@@ -215,6 +223,7 @@ def to_copy(tree: Tree, dst: Path) -> int:
 
 def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
            echo: Callable[[str], None] = print,
+           progress: Callable[[str], None] | None = None,
            tick: Callable[[], None] | None = None) -> tuple[int, int]:
     """Покласти `tree` із `src` у `dst`: лише нове й змінене, потім звірити.
 
@@ -232,6 +241,8 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
     total = to_copy(tree, dst)
     step = min(max(total // 20, _COPY_STEP_MIN), _COPY_STEP_MAX) if total > 0 else _COPY_STEP_MIN
     shown = 0
+    report = progress or echo
+    progress_sec = _LIVE_PROGRESS_SEC if progress is not None else _COPY_PROGRESS_SEC
     started = last_report = time.monotonic()
     for rel, (size, mtime) in tree.files.items():
         target = dst / rel
@@ -245,7 +256,9 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
         copied += 1
         done_bytes += max(size, 0)
         now = time.monotonic()
-        if done_bytes - shown >= step or now - last_report >= _COPY_PROGRESS_SEC:
+        should_report = (now - last_report >= progress_sec if progress is not None
+                         else done_bytes - shown >= step or now - last_report >= progress_sec)
+        if should_report:
             shown = done_bytes
             last_report = now
             elapsed = now - started
@@ -253,10 +266,10 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
             if elapsed >= 1.0 and done_bytes > 0 and total > done_bytes:
                 rate = done_bytes / elapsed
                 eta = (total - done_bytes) / rate
-                echo(f"    … {human(done_bytes)} з {human(total)} "
-                     f"({pct}%, {human(int(rate))}/с, ~{_format_eta(eta)})")
+                report(f"    … {human(done_bytes)} з {human(total)} "
+                       f"({pct}%, {human(int(rate))}/с, ~{_format_eta(eta)})")
             else:
-                echo(f"    … {human(done_bytes)} з {human(total)} ({pct}%)")
+                report(f"    … {human(done_bytes)} з {human(total)} ({pct}%)")
             if tick is not None:
                 tick()
     if prune:
@@ -264,7 +277,13 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
         for rel in extra.files:
             if rel not in tree.files:
                 (dst / rel).unlink(missing_ok=True)
-    bad = diff(tree.sizes(), scan(dst).sizes())
+    verify_tree = scan(
+        dst,
+        progress_sec=_LIVE_PROGRESS_SEC if progress is not None else None,
+        on_progress=(lambda count, _size: report(f"  … звіряю {dst.name}: {count} файлів"))
+        if progress is not None else None,
+    )
+    bad = diff(tree.sizes(), verify_tree.sizes())
     if bad:
         raise TransferError("копія не зійшлась з оригіналом:\n  " + "\n  ".join(bad[:20]))
     same = len(tree.files) - copied
@@ -408,7 +427,8 @@ def _existing_bundle(dest: Path) -> dict[str, Any]:
 
 def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool = False,
                 with_memory: bool = True,
-                echo: Callable[[str], None] | None = None) -> ExportPlan:
+                echo: Callable[[str], None] | None = None,
+                progress: Callable[[str], None] | None = None) -> ExportPlan:
     """Порахувати експорт. Нічого не пише."""
     from nyshporka.core import appdirs
     from nyshporka.core.lock import LockBusy, check_busy
@@ -445,7 +465,8 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
         p.warnings.append("тека синхронізується з хмарою — пакунок поїде в мережу, "
                           "і копіювання буде повільним")
 
-    tree = _scan_section(hub, label=f"простір ({hub})", echo=echo, top=_skip_top)
+    tree = _scan_section(hub, label=f"простір ({hub})", echo=echo, progress=progress,
+                         top=_skip_top)
     p.trees[WS_DIR] = tree
     p.links = [f"{WS_DIR}/{x}" for x in tree.links]
     p.ws_bytes = tree.bytes
@@ -463,7 +484,7 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
         elif with_roots:
             i += 1
             r.slot = _slot_name(i, str(raw))
-            rt = _scan_section(Path(raw), label=f"корінь ({raw})", echo=echo)
+            rt = _scan_section(Path(raw), label=f"корінь ({raw})", echo=echo, progress=progress)
             p.trees[r.slot] = rt
             r.bytes = rt.bytes
             p.copy_bytes += to_copy(rt, to / r.slot)
@@ -477,13 +498,13 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
                           ("cache", appdirs.cache_dir())):
             if src.is_dir():
                 p.data[name] = src
-                dt = _scan_section(src, label=f"дані ({name})", echo=echo)
+                dt = _scan_section(src, label=f"дані ({name})", echo=echo, progress=progress)
                 p.trees[f"{DATA_DIR}/{name}"] = dt
                 p.copy_bytes += to_copy(dt, to / DATA_DIR / name)
     if with_memory:
         p.memory = _memory_dirs(hub)
         for key, src in p.memory.items():
-            mt = _scan_section(src, label=f"пам'ять ({key})", echo=echo)
+            mt = _scan_section(src, label=f"пам'ять ({key})", echo=echo, progress=progress)
             p.trees[f"{MEMORY_DIR}/{key}"] = mt
             p.copy_bytes += to_copy(mt, to / MEMORY_DIR / key)
 
@@ -512,7 +533,8 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
                       newline="\n")
 
 
-def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
+def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print,
+               progress: Callable[[str], None] | None = None) -> Path:
     """Покласти пакунок. Простір під замком: живий демон дописував би копію."""
     from nyshporka import __version__
     from nyshporka.core.lock import LockBusy, WorkspaceLock
@@ -534,7 +556,7 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
         echo("1. простір")
         ws_tree = p.trees.get(WS_DIR) or scan(p.source, top=_skip_top)
         mirror(p.source, ws_tree, to / WS_DIR, prune=True,
-               echo=echo, tick=lock.beat)
+               echo=echo, progress=progress, tick=lock.beat)
     slots = {r.slot for r in p.roots if r.slot}
     if any(r.slot for r in p.roots):
         echo("2. корені справ поза простором")
@@ -542,7 +564,7 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
         if r.slot:
             echo(f"  {r.path} → {r.slot}")
             rt = p.trees.get(r.slot) or scan(Path(r.path))
-            mirror(Path(r.path), rt, to / r.slot, prune=True, echo=echo)
+            mirror(Path(r.path), rt, to / r.slot, prune=True, echo=echo, progress=progress)
     # Корінь, якого цього разу не клали, не має лишатись у пакунку зі старого разу.
     if (to / ROOTS_DIR).is_dir():
         for old in (to / ROOTS_DIR).iterdir():
@@ -552,12 +574,12 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
         echo("3. довідники й ваги")
     for name, src in p.data.items():
         dt = p.trees.get(f"{DATA_DIR}/{name}") or scan(src)
-        mirror(src, dt, to / DATA_DIR / name, prune=True, echo=echo)
+        mirror(src, dt, to / DATA_DIR / name, prune=True, echo=echo, progress=progress)
     if p.memory:
         echo("4. пам'ять помічника")
     for key, src in p.memory.items():
         mt = p.trees.get(f"{MEMORY_DIR}/{key}") or scan(src)
-        mirror(src, mt, to / MEMORY_DIR / key, prune=True, echo=echo)
+        mirror(src, mt, to / MEMORY_DIR / key, prune=True, echo=echo, progress=progress)
 
     sections = [WS_DIR, *sorted(slots), *(f"{DATA_DIR}/{n}" for n in p.data),
                 *(f"{MEMORY_DIR}/{k}" for k in p.memory)]
@@ -593,6 +615,7 @@ class ImportPlan:
     free_bytes: int = -1
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    trees: dict[str, Tree] = field(default_factory=dict, repr=False)
 
     @property
     def roots(self) -> list[dict[str, Any]]:
@@ -634,7 +657,9 @@ def _skeleton(target: Path) -> bool:
 
 
 def plan_import(bundle: str | Path, target: str | Path | None = None,
-                roots_to: str | Path | None = None) -> ImportPlan:
+                roots_to: str | Path | None = None,
+                *, echo: Callable[[str], None] | None = None,
+                progress: Callable[[str], None] | None = None) -> ImportPlan:
     """Порахувати імпорт. Нічого не пише."""
     from nyshporka import __version__
     from nyshporka.core.workspace import validate_root
@@ -662,8 +687,10 @@ def plan_import(bundle: str | Path, target: str | Path | None = None,
                           f"зі старою програмою")
     files: dict[str, int] = {k: int(v) for k, v in (meta.get("files") or {}).items()}
     have: dict[str, int] = {}
-    for sec in {k.split("/", 1)[0] for k in files}:
-        for rel, size in scan(src / sec).sizes().items():
+    for sec in sorted({k.split("/", 1)[0] for k in files}):
+        tree = _scan_section(src / sec, label=f"пакунок ({sec})", echo=echo, progress=progress)
+        p.trees[sec] = tree
+        for rel, size in tree.sizes().items():
             have[f"{sec}/{rel}"] = size
     bad = diff(files, have)
     if bad:
@@ -820,7 +847,18 @@ def _empty(d: Path) -> bool:
     return not d.is_dir() or not any(d.iterdir())
 
 
+def _subtree(tree: Tree, sub: str) -> Tree:
+    prefix = f"{sub}/"
+    cut = len(prefix)
+    return Tree(
+        dirs=[d[cut:] for d in tree.dirs if d.startswith(prefix)],
+        files={k[cut:]: v for k, v in tree.files.items() if k.startswith(prefix)},
+        links=[link[cut:] for link in tree.links if link.startswith(prefix)],
+    )
+
+
 def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
+               progress: Callable[[str], None] | None = None,
                build_cases: bool = True) -> ImportReport:
     """Розкласти пакунок на цій машині. Пакунок не змінюється."""
     from nyshporka.core import appdirs
@@ -843,10 +881,16 @@ def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
         echo(f"  порожній простір відсунуто: {aside}")
 
     def tree_of(section: str) -> Tree:
+        if section in p.trees:
+            return p.trees[section]
+        if "/" in section:
+            top, sub = section.split("/", 1)
+            if top in p.trees:
+                return _subtree(p.trees[top], sub)
         return scan(src / section)
 
     echo("1. простір")
-    mirror(src / WS_DIR, tree_of(WS_DIR), to, echo=echo)
+    mirror(src / WS_DIR, tree_of(WS_DIR), to, echo=echo, progress=progress)
 
     moves: dict[str, Path] = {}
     for r in p.roots:
@@ -858,33 +902,42 @@ def run_import(p: ImportPlan, *, echo: Callable[[str], None] = print,
             dest = p.roots_to / slot.split("/", 1)[1]
             if not rep.roots_moved:
                 echo(f"2. корені справ → {p.roots_to}")
-            mirror(src / slot, tree_of(slot), dest, echo=echo)
+            mirror(src / slot, tree_of(slot), dest, echo=echo, progress=progress)
             moves[old] = dest
             rep.roots_moved[old] = dest
         elif old:
             rep.roots_missing.append(old)
     rewrite_roots(to / MARKER, moves)
 
-    for name in meta.get("data") or []:
+    data_items = list(meta.get("data") or [])
+    if data_items:
+        echo("3. довідники й ваги")
+    for name in data_items:
         dest = appdirs.data_dir() / "catalog" if name == "catalog" else appdirs.cache_dir()
         if not _empty(dest):
             rep.data[name] = f"лишено наявне: {dest}"
             continue
-        mirror(src / DATA_DIR / name, tree_of(f"{DATA_DIR}/{name}"), dest, echo=echo)
+        mirror(src / DATA_DIR / name, tree_of(f"{DATA_DIR}/{name}"), dest,
+               echo=echo, progress=progress)
         rep.data[name] = str(dest)
-    for key in meta.get("memory") or []:
+    mem_items = list(meta.get("memory") or [])
+    if mem_items:
+        echo("4. пам'ять помічника")
+    for key in mem_items:
         root = to if key == HUB_MEMORY else to / key
         dest = memory_dir(root)
         if not _empty(dest):
             rep.memory[key] = f"лишено наявну: {dest}"
             continue
-        mirror(src / MEMORY_DIR / key, tree_of(f"{MEMORY_DIR}/{key}"), dest, echo=echo)
+        mirror(src / MEMORY_DIR / key, tree_of(f"{MEMORY_DIR}/{key}"), dest,
+               echo=echo, progress=progress)
         rep.memory[key] = str(dest)
 
     rep.git_hook = _fix_git_hook(to)
     rep.agent_files = _fix_agent_files(to)
     remember(use(to))
     if build_cases:
+        echo("5. реєстр справ")
         try:
             from nyshporka.cases import db
             from nyshporka.utils.plural import cases
