@@ -216,9 +216,19 @@ def _same(dst: Path, size: int, mtime: float) -> bool:
     return st.st_size == size and abs(st.st_mtime - mtime) <= _MTIME_SLACK
 
 
+def _to_copy_stats(tree: Tree, dst: Path) -> tuple[int, int]:
+    """Скільки байтів і файлів ще треба покласти в `dst`."""
+    total_bytes = total_files = 0
+    for rel, (s, m) in tree.files.items():
+        if not _same(dst / rel, s, m):
+            total_bytes += max(s, 0)
+            total_files += 1
+    return total_bytes, total_files
+
+
 def to_copy(tree: Tree, dst: Path) -> int:
     """Скільки байтів ще треба покласти в `dst` (решта там уже така сама)."""
-    return sum(max(s, 0) for rel, (s, m) in tree.files.items() if not _same(dst / rel, s, m))
+    return _to_copy_stats(tree, dst)[0]
 
 
 def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
@@ -238,12 +248,15 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
     for rel in tree.dirs:
         (dst / rel).mkdir(parents=True, exist_ok=True)
     copied = done_bytes = 0
-    total = to_copy(tree, dst)
+    total, total_files = _to_copy_stats(tree, dst)
     step = min(max(total // 20, _COPY_STEP_MIN), _COPY_STEP_MAX) if total > 0 else _COPY_STEP_MIN
     shown = 0
     report = progress or echo
     progress_sec = _LIVE_PROGRESS_SEC if progress is not None else _COPY_PROGRESS_SEC
-    started = last_report = time.monotonic()
+    started = last_report = prev_t = time.monotonic()
+    prev_bytes = prev_files = 0
+    ema_byte_rate = ema_file_rate = 0.0
+    alpha = 0.3
     for rel, (size, mtime) in tree.files.items():
         target = dst / rel
         if _same(target, size, mtime):
@@ -261,15 +274,30 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
         if should_report:
             shown = done_bytes
             last_report = now
-            elapsed = now - started
+            dt = now - prev_t
+            if dt > 0.05:
+                inst_bytes = (done_bytes - prev_bytes) / dt
+                inst_files = (copied - prev_files) / dt
+                ema_byte_rate = (inst_bytes if ema_byte_rate == 0.0
+                                 else alpha * inst_bytes + (1.0 - alpha) * ema_byte_rate)
+                ema_file_rate = (inst_files if ema_file_rate == 0.0
+                                 else alpha * inst_files + (1.0 - alpha) * ema_file_rate)
+                prev_t = now
+                prev_bytes = done_bytes
+                prev_files = copied
             pct = int(done_bytes * 100 / total) if total > 0 else 100
-            if elapsed >= 1.0 and done_bytes > 0 and total > done_bytes:
-                rate = done_bytes / elapsed
-                eta = (total - done_bytes) / rate
+            if now - started >= 1.0 and (total > done_bytes or total_files > copied):
+                eta_bytes = ((total - done_bytes) / ema_byte_rate
+                             if ema_byte_rate > 0 and total > done_bytes else 0.0)
+                eta_files = ((total_files - copied) / ema_file_rate
+                             if ema_file_rate > 0 and total_files > copied else 0.0)
+                eta = max(eta_bytes, eta_files)
                 report(f"    … {human(done_bytes)} з {human(total)} "
-                       f"({pct}%, {human(int(rate))}/с, ~{_format_eta(eta)})")
+                       f"({pct}%) · {copied}/{total_files} файлів · "
+                       f"{human(int(ema_byte_rate))}/с · ~{_format_eta(eta)}")
             else:
-                report(f"    … {human(done_bytes)} з {human(total)} ({pct}%)")
+                report(f"    … {human(done_bytes)} з {human(total)} "
+                       f"({pct}%) · {copied}/{total_files} файлів")
             if tick is not None:
                 tick()
     if prune:
