@@ -458,3 +458,28 @@ def test_import_progress_and_cached_trees(old, new_machine, tmp_path: Path, monk
     assert any("%)" in line for line in import_prog)
     assert not any("%)" in line for line in import_lines)
 
+
+def test_mirror_eta_uses_ema_and_file_rate(tmp_path: Path, monkeypatch) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    # One large file (100 KB) followed by 10 tiny files (10 B each).
+    (src / "00_big.bin").write_bytes(b"x" * 100_000)
+    for i in range(10):
+        (src / f"10_small_{i}.txt").write_bytes(b"y" * 10)
+    tree = T.scan(src)
+
+    # Simulate 1s for the big file, then 1s per tiny file so file-rate dominates ETA.
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0])
+    monkeypatch.setattr(T.time, "monotonic", lambda: next(ticks, 12.0))
+    monkeypatch.setattr(T, "_LIVE_PROGRESS_SEC", 0.5)
+
+    prog: list[str] = []
+    T.mirror(src, tree, dst, echo=lambda _m: None, progress=prog.append)
+    # After the big file + first small file (at t=2.0, 9 small files left),
+    # byte ETA would be ~0s, while file-rate ETA is >5s.
+    assert any("1/11 файлів" in line or "2/11 файлів" in line for line in prog)
+    eta_lines = [line for line in prog if "~" in line]
+    assert eta_lines
+    assert not eta_lines[0].endswith("~0с)")
+
