@@ -473,6 +473,7 @@ def test_mirror_eta_uses_ema_and_file_rate(tmp_path: Path, monkeypatch) -> None:
     ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0])
     monkeypatch.setattr(T.time, "monotonic", lambda: next(ticks, 12.0))
     monkeypatch.setattr(T, "_LIVE_PROGRESS_SEC", 0.5)
+    monkeypatch.setattr(T, "_COPY_WORKERS", 1)
 
     prog: list[str] = []
     T.mirror(src, tree, dst, echo=lambda _m: None, progress=prog.append)
@@ -482,4 +483,38 @@ def test_mirror_eta_uses_ema_and_file_rate(tmp_path: Path, monkeypatch) -> None:
     eta_lines = [line for line in prog if "~" in line]
     assert eta_lines
     assert not eta_lines[0].endswith("~0с)")
+
+
+def test_run_export_reuses_verify_tree_and_parallel_mirror(
+    old, tmp_path: Path, monkeypatch,
+) -> None:
+    dest = tmp_path / "drive" / "bundle"
+    p = T.plan_export(dest, with_roots=True, with_data=True)
+    orig_scan = T.scan
+    dest_scans: list[Path] = []
+
+    def tracking_scan(root: Path, **kw):
+        if dest in root.parents or root == dest:
+            dest_scans.append(root)
+        return orig_scan(root, **kw)
+
+    monkeypatch.setattr(T, "scan", tracking_scan)
+    T.run_export(p, echo=lambda _m: None)
+    # Each exported section is scanned once at destination (for verification),
+    # never a second time for manifest generation.
+    assert len(dest_scans) == len(set(dest_scans))
+    assert (dest / T.WS_DIR) in dest_scans
+
+    # Parallel mirror also handles a synthetic Tree whose `dirs` list is empty.
+    src = tmp_path / "p_src"
+    dst = tmp_path / "p_dst"
+    for i in range(12):
+        f = src / f"sub{i % 3}" / f"f{i}.txt"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"data-{i}", encoding="utf-8")
+    full_tree = T.scan(src)
+    no_dirs_tree = T.Tree(dirs=[], files=full_tree.files)
+    copied, _ = T.mirror(src, no_dirs_tree, dst, echo=lambda _m: None)
+    assert copied == 12
+    assert (dst / "sub0" / "f0.txt").read_text(encoding="utf-8") == "data-0"
 
