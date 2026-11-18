@@ -540,6 +540,18 @@ def test_case_scoped_export_and_incremental_import(old, new_machine, tmp_path: P
     )
 
     bundle = tmp_path / "drive" / "case-delta"
+    # Verify lookup by registry key (`db.query_rows`) as well as direct path.
+    monkeypatch.setattr(
+        "nyshporka.cases.db.query_rows",
+        lambda q="", **_k: [] if q else [{
+            "key": "TEST/1/1/1", "shifra": "ТЕСТ 1-1-1",
+            "path": str(target_case), "htr_runs": ["in_case_run"],
+        }],
+    )
+    ep_by_key = T.plan_export(bundle, cases=["TEST/1/1/1"])
+    assert ep_by_key.scope == "cases"
+    assert ep_by_key.cases == ["ТЕСТ 1-1-1"]
+
     ep = T.plan_export(bundle, cases=[str(target_case)])
     assert ep.scope == "cases"
     assert not ep.problems
