@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -72,6 +73,10 @@ _FAT_LIMIT = 4 * 1024 ** 3 - 1
 #: Різниця часу зміни, яку ще вважаємо «тим самим файлом»: FAT/exFAT
 #: зберігають час із кроком до 2 с.
 _MTIME_SLACK = 2.0
+_SCAN_PROGRESS_SEC = 1.5
+_COPY_PROGRESS_SEC = 2.0
+_COPY_STEP_MIN = 32 * 1024 ** 2
+_COPY_STEP_MAX = 100 * 1024 ** 2
 
 _WIN_BAD_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 _WIN_RESERVED = frozenset({"con", "prn", "aux", "nul",
@@ -119,7 +124,8 @@ def _skip_top(name: str) -> bool:
 
 
 def scan(root: Path, *, top: Callable[[str], bool] | None = None,
-         skip: Callable[[str], bool] | None = None) -> Tree:
+         skip: Callable[[str], bool] | None = None,
+         on_progress: Callable[[int, int], None] | None = None) -> Tree:
     """Обійти `root`, не заходячи в посилання.
 
     `top` відсіює імена лише в корені, `skip` — відносні шляхи будь-де.
@@ -127,6 +133,8 @@ def scan(root: Path, *, top: Callable[[str], bool] | None = None,
     out = Tree()
     if not root.is_dir():
         return out
+    total_bytes = 0
+    last_report = time.monotonic()
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         rel_here = "" if here == root else here.relative_to(root).as_posix()
@@ -155,9 +163,41 @@ def scan(root: Path, *, top: Callable[[str], bool] | None = None,
             try:
                 st = p.stat()
                 out.files[rel] = (st.st_size, st.st_mtime)
+                total_bytes += max(st.st_size, 0)
             except OSError:
                 out.files[rel] = (-1, 0.0)
+            if on_progress is not None and (len(out.files) & 255) == 0:
+                now = time.monotonic()
+                if now - last_report >= _SCAN_PROGRESS_SEC:
+                    last_report = now
+                    on_progress(len(out.files), total_bytes)
     return out
+
+
+def _format_eta(seconds: float) -> str:
+    sec = max(int(round(seconds)), 0)
+    if sec < 60:
+        return f"{sec}с"
+    minutes, sec = divmod(sec, 60)
+    if minutes < 60:
+        return f"{minutes}хв {sec:02d}с"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}год {minutes:02d}хв"
+
+
+def _scan_section(root: Path, *, label: str, echo: Callable[[str], None] | None = None,
+                  top: Callable[[str], bool] | None = None,
+                  skip: Callable[[str], bool] | None = None) -> Tree:
+    """Просканувати розділ, показуючи перебіг для великих тек."""
+    if echo is None:
+        return scan(root, top=top, skip=skip)
+    echo(f"сканую {label}…")
+    return scan(
+        root,
+        top=top,
+        skip=skip,
+        on_progress=lambda count, size: echo(f"  … {count} файлів ({human(size)})"),
+    )
 
 
 def _same(dst: Path, size: int, mtime: float) -> bool:
@@ -190,8 +230,9 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
         (dst / rel).mkdir(parents=True, exist_ok=True)
     copied = done_bytes = 0
     total = to_copy(tree, dst)
-    step = max(total // 10, 256 * 1024 ** 2)
+    step = min(max(total // 20, _COPY_STEP_MIN), _COPY_STEP_MAX) if total > 0 else _COPY_STEP_MIN
     shown = 0
+    started = last_report = time.monotonic()
     for rel, (size, mtime) in tree.files.items():
         target = dst / rel
         if _same(target, size, mtime):
@@ -203,9 +244,19 @@ def mirror(src: Path, tree: Tree, dst: Path, *, prune: bool = False,
             raise TransferError(f"не вдалось скопіювати {src / rel} → {target}: {exc}") from None
         copied += 1
         done_bytes += max(size, 0)
-        if done_bytes - shown >= step:
+        now = time.monotonic()
+        if done_bytes - shown >= step or now - last_report >= _COPY_PROGRESS_SEC:
             shown = done_bytes
-            echo(f"    … {human(done_bytes)} з {human(total)}")
+            last_report = now
+            elapsed = now - started
+            pct = int(done_bytes * 100 / total) if total > 0 else 100
+            if elapsed >= 1.0 and done_bytes > 0 and total > done_bytes:
+                rate = done_bytes / elapsed
+                eta = (total - done_bytes) / rate
+                echo(f"    … {human(done_bytes)} з {human(total)} "
+                     f"({pct}%, {human(int(rate))}/с, ~{_format_eta(eta)})")
+            else:
+                echo(f"    … {human(done_bytes)} з {human(total)} ({pct}%)")
             if tick is not None:
                 tick()
     if prune:
@@ -308,6 +359,7 @@ class ExportPlan:
     links: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    trees: dict[str, Tree] = field(default_factory=dict, repr=False)
 
 
 def _slot_name(i: int, path: str) -> str:
@@ -355,7 +407,8 @@ def _existing_bundle(dest: Path) -> dict[str, Any]:
 
 
 def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool = False,
-                with_memory: bool = True) -> ExportPlan:
+                with_memory: bool = True,
+                echo: Callable[[str], None] | None = None) -> ExportPlan:
     """Порахувати експорт. Нічого не пише."""
     from nyshporka.core import appdirs
     from nyshporka.core.workspace import workspace
@@ -386,7 +439,8 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
         p.warnings.append("тека синхронізується з хмарою — пакунок поїде в мережу, "
                           "і копіювання буде повільним")
 
-    tree = scan(hub, top=_skip_top)
+    tree = _scan_section(hub, label=f"простір ({hub})", echo=echo, top=_skip_top)
+    p.trees[WS_DIR] = tree
     p.links = [f"{WS_DIR}/{x}" for x in tree.links]
     p.ws_bytes = tree.bytes
     p.copy_bytes = to_copy(tree, to / WS_DIR)
@@ -403,7 +457,8 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
         elif with_roots:
             i += 1
             r.slot = _slot_name(i, str(raw))
-            rt = scan(Path(raw))
+            rt = _scan_section(Path(raw), label=f"корінь ({raw})", echo=echo)
+            p.trees[r.slot] = rt
             r.bytes = rt.bytes
             p.copy_bytes += to_copy(rt, to / r.slot)
             p.links += [f"{r.slot}/{x}" for x in rt.links]
@@ -416,11 +471,15 @@ def plan_export(dest: str | Path, *, with_roots: bool = False, with_data: bool =
                           ("cache", appdirs.cache_dir())):
             if src.is_dir():
                 p.data[name] = src
-                p.copy_bytes += to_copy(scan(src), to / DATA_DIR / name)
+                dt = _scan_section(src, label=f"дані ({name})", echo=echo)
+                p.trees[f"{DATA_DIR}/{name}"] = dt
+                p.copy_bytes += to_copy(dt, to / DATA_DIR / name)
     if with_memory:
         p.memory = _memory_dirs(hub)
         for key, src in p.memory.items():
-            p.copy_bytes += to_copy(scan(src), to / MEMORY_DIR / key)
+            mt = _scan_section(src, label=f"пам'ять ({key})", echo=echo)
+            p.trees[f"{MEMORY_DIR}/{key}"] = mt
+            p.copy_bytes += to_copy(mt, to / MEMORY_DIR / key)
 
     p.fs = fs_type(to)
     if big and p.fs in _FAT:
@@ -467,7 +526,8 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
     _write_json(to / PARTIAL, {"source": source})
     with lock:
         echo("1. простір")
-        mirror(p.source, scan(p.source, top=_skip_top), to / WS_DIR, prune=True,
+        ws_tree = p.trees.get(WS_DIR) or scan(p.source, top=_skip_top)
+        mirror(p.source, ws_tree, to / WS_DIR, prune=True,
                echo=echo, tick=lock.beat)
     slots = {r.slot for r in p.roots if r.slot}
     if any(r.slot for r in p.roots):
@@ -475,7 +535,8 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
     for r in p.roots:
         if r.slot:
             echo(f"  {r.path} → {r.slot}")
-            mirror(Path(r.path), scan(Path(r.path)), to / r.slot, prune=True, echo=echo)
+            rt = p.trees.get(r.slot) or scan(Path(r.path))
+            mirror(Path(r.path), rt, to / r.slot, prune=True, echo=echo)
     # Корінь, якого цього разу не клали, не має лишатись у пакунку зі старого разу.
     if (to / ROOTS_DIR).is_dir():
         for old in (to / ROOTS_DIR).iterdir():
@@ -484,11 +545,13 @@ def run_export(p: ExportPlan, *, echo: Callable[[str], None] = print) -> Path:
     if p.data:
         echo("3. довідники й ваги")
     for name, src in p.data.items():
-        mirror(src, scan(src), to / DATA_DIR / name, prune=True, echo=echo)
+        dt = p.trees.get(f"{DATA_DIR}/{name}") or scan(src)
+        mirror(src, dt, to / DATA_DIR / name, prune=True, echo=echo)
     if p.memory:
         echo("4. пам'ять помічника")
     for key, src in p.memory.items():
-        mirror(src, scan(src), to / MEMORY_DIR / key, prune=True, echo=echo)
+        mt = p.trees.get(f"{MEMORY_DIR}/{key}") or scan(src)
+        mirror(src, mt, to / MEMORY_DIR / key, prune=True, echo=echo)
 
     sections = [WS_DIR, *sorted(slots), *(f"{DATA_DIR}/{n}" for n in p.data),
                 *(f"{MEMORY_DIR}/{k}" for k in p.memory)]

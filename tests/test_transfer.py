@@ -381,3 +381,29 @@ def test_cli_round_trip(old, new_machine, tmp_path: Path, monkeypatch) -> None:
     assert got.exit_code == 0, got.output
     assert "nysh roots add" in got.output and "2 справи" in got.output
     assert os.path.isfile(new_machine["target"] / W.MARKER)
+
+
+def test_export_progress_and_cached_trees(old, tmp_path: Path, monkeypatch) -> None:
+    lines: list[str] = []
+    dest = tmp_path / "drive" / "bundle"
+    p = T.plan_export(dest, with_roots=True, with_data=True, echo=lines.append)
+    assert any(line.startswith("сканую простір") for line in lines)
+    assert any(line.startswith("сканую корінь") for line in lines)
+    assert T.WS_DIR in p.trees
+
+    # `run_export` reuses cached `p.trees` instead of re-scanning source directories,
+    # and `mirror` emits percentage progress when `_COPY_PROGRESS_SEC` elapses.
+    copy_lines: list[str] = []
+    monkeypatch.setattr(T, "_COPY_PROGRESS_SEC", 0.0)
+    orig_scan = T.scan
+    scanned_paths: list[Path] = []
+
+    def tracking_scan(root: Path, **kw):
+        scanned_paths.append(root)
+        return orig_scan(root, **kw)
+
+    monkeypatch.setattr(T, "scan", tracking_scan)
+    T.run_export(p, echo=copy_lines.append)
+    assert old["hub"] not in scanned_paths
+    assert old["ext"] not in scanned_paths
+    assert any("%)" in line for line in copy_lines)
