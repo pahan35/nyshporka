@@ -159,6 +159,20 @@ def read(root: Path) -> LockInfo | None:
         return None
 
 
+def check_busy(root: Path) -> LockInfo | None:
+    """Повернути власника живого замка, якщо простір зараз зайнятий, або None.
+
+    Нічого не пише й не знімає — для швидкої перевірки перед довгою операцією.
+    """
+    holder = read(root)
+    if holder is None:
+        return None
+    alive = _alive_state(holder.pid, holder.started)
+    if alive is False or (alive is None and holder.is_stale()):
+        return None
+    return holder
+
+
 class WorkspaceLock:
     """Замок простору. Використовувати як контекст.
 
