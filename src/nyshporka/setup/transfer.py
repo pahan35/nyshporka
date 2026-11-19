@@ -30,8 +30,10 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +46,11 @@ FORMAT = 1
 WS_DIR = "workspace"
 ROOTS_DIR = "roots"
 DATA_DIR = "data"
+
+_SCAN_PROGRESS_SEC = 10.0
+_COPY_PROGRESS_SEC = 15.0
+_LIVE_PROGRESS_SEC = 0.25
+_COPY_WORKERS = 4
 
 #: Що з кореня простору не їде: venv рушіїв і замок (як у `relocate`) і
 #: програма, яку туди поставив `relocate` — вона прив'язана до машини.
@@ -74,13 +81,30 @@ class _Entry:
     mtime: float
 
 
+def _format_eta(seconds: float) -> str:
+    secs = max(int(seconds), 0)
+    if secs < 60:
+        return f"{secs} с"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins} хв {secs:02d} с"
+    hours, mins = divmod(mins, 60)
+    return f"{hours} год {mins:02d} хв"
+
+
 def _walk(root: Path, skip_top: tuple[str, ...] = (),
-          skip_rel: tuple[str, ...] = ()) -> dict[str, _Entry]:
+          skip_rel: tuple[str, ...] = (), *, label: str = "",
+          echo: Callable[[str], None] | None = None,
+          progress: Callable[[str], None] | None = None) -> dict[str, _Entry]:
     """Кожен файл під `root`: NFC-шлях відносно `root` → запис."""
     out: dict[str, _Entry] = {}
     if not root.is_dir():
         return out
     skip = {_nfc(s) for s in skip_rel}
+    report = progress or echo
+    interval = _LIVE_PROGRESS_SEC if progress is not None else _SCAN_PROGRESS_SEC
+    last = time.monotonic()
+    total_bytes = 0
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         if here == root:
@@ -97,6 +121,14 @@ def _walk(root: Path, skip_top: tuple[str, ...] = (),
                 out[rel] = _Entry(p, -1, 0.0)
                 continue
             out[rel] = _Entry(p, st.st_size, st.st_mtime)
+            total_bytes += max(st.st_size, 0)
+            if report is not None and label:
+                now = time.monotonic()
+                if now - last >= interval:
+                    last = now
+                    report(f"  … {label}: знайдено {len(out)} файлів ({human(total_bytes)})")
+    if echo is not None and label:
+        echo(f"  ✓ {label}: {len(out)} файлів ({human(total_bytes)})")
     return out
 
 
@@ -110,8 +142,29 @@ class SyncReport:
     files: dict[str, int] = field(default_factory=dict)
 
 
+def _copy_one(src_file: Path, dst_file: Path) -> int:
+    try:
+        shutil.copy2(src_file, dst_file)
+    except FileNotFoundError:
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src_file, dst_file)
+        except OSError as exc:
+            raise TransferError(f"не вдалось скопіювати {src_file} → {dst_file}: {exc}") from None
+    except OSError as exc:
+        raise TransferError(f"не вдалось скопіювати {src_file} → {dst_file}: {exc}") from None
+    try:
+        return dst_file.stat().st_size
+    except OSError:
+        return -1
+
+
 def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
-              skip_rel: tuple[str, ...] = ()) -> SyncReport:
+              skip_rel: tuple[str, ...] = (), *,
+              want: dict[str, _Entry] | None = None,
+              echo: Callable[[str], None] = print,
+              progress: Callable[[str], None] | None = None,
+              tick: Callable[[], None] | None = None) -> SyncReport:
     """Дзеркало `src` у `dst`: нове й змінене копіюється, зайве в `dst` знімається.
 
     Незмінений файл (той самий розмір, mtime у межах `MTIME_SLACK`) не
@@ -119,7 +172,8 @@ def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
     Зайве знімається, бо інакше видалена картка воскресла б після імпорту.
     Наприкінці — звірка пофайлово; не зійшлось — `TransferError`.
     """
-    want = _walk(src, skip_top, skip_rel)
+    if want is None:
+        want = _walk(src, skip_top, skip_rel)
     have = _walk(dst)
     rep = SyncReport()
     # 🔴 Теки — теж, і порожні: git без `.git/refs` і `.git/objects` (вони
@@ -131,6 +185,9 @@ def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
             dirnames[:] = [d for d in dirnames if d not in skip_top]
         for d in dirnames:
             (dst / (here / d).relative_to(src)).mkdir(parents=True, exist_ok=True)
+
+    pending: list[tuple[str, _Entry, Path]] = []
+    total_bytes = 0
     for rel, e in want.items():
         h = have.get(rel)
         if h is not None and h.size == e.size and abs(h.mtime - e.mtime) <= MTIME_SLACK:
@@ -138,14 +195,79 @@ def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
             continue
         target = h.path if h is not None else dst / e.path.relative_to(src)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(e.path, target)
+        pending.append((rel, e, target))
+        total_bytes += max(e.size, 0)
+
+    total_files = len(pending)
+    got = {k: v.size for k, v in have.items()}
+    report = progress or echo
+    interval = _LIVE_PROGRESS_SEC if progress is not None else _COPY_PROGRESS_SEC
+    started = last_report = prev_t = time.monotonic()
+    prev_bytes = prev_files = 0
+    ema_byte_rate = ema_file_rate = 0.0
+    alpha = 0.3
+
+    def _on_copied(rel: str, e: _Entry, copied_size: int) -> None:
+        nonlocal last_report, prev_t, prev_bytes, prev_files, ema_byte_rate, ema_file_rate
         rep.copied += 1
         rep.copied_bytes += max(e.size, 0)
+        if copied_size >= 0:
+            got[rel] = copied_size
+        now = time.monotonic()
+        if now - last_report >= interval:
+            last_report = now
+            dt = now - prev_t
+            if dt > 0.05:
+                inst_bytes = (rep.copied_bytes - prev_bytes) / dt
+                inst_files = (rep.copied - prev_files) / dt
+                ema_byte_rate = (inst_bytes if ema_byte_rate == 0.0
+                                 else alpha * inst_bytes + (1.0 - alpha) * ema_byte_rate)
+                ema_file_rate = (inst_files if ema_file_rate == 0.0
+                                 else alpha * inst_files + (1.0 - alpha) * ema_file_rate)
+                prev_t = now
+                prev_bytes = rep.copied_bytes
+                prev_files = rep.copied
+            pct = int(rep.copied_bytes * 100 / total_bytes) if total_bytes > 0 else 100
+            if now - started >= 1.0 and (total_bytes > rep.copied_bytes or total_files > rep.copied):
+                eta_bytes = ((total_bytes - rep.copied_bytes) / ema_byte_rate
+                             if ema_byte_rate > 0 and total_bytes > rep.copied_bytes else 0.0)
+                eta_files = ((total_files - rep.copied) / ema_file_rate
+                             if ema_file_rate > 0 and total_files > rep.copied else 0.0)
+                eta = max(eta_bytes, eta_files)
+                report(f"    … {human(rep.copied_bytes)} з {human(total_bytes)} "
+                       f"({pct}%) · {rep.copied}/{total_files} файлів · "
+                       f"{human(int(ema_byte_rate))}/с · ~{_format_eta(eta)}")
+            else:
+                report(f"    … {human(rep.copied_bytes)} з {human(total_bytes)} "
+                       f"({pct}%) · {rep.copied}/{total_files} файлів")
+            if tick is not None:
+                tick()
+
+    if len(pending) <= 1:
+        for rel, e, target in pending:
+            _on_copied(rel, e, _copy_one(e.path, target))
+    else:
+        with ThreadPoolExecutor(max_workers=min(_COPY_WORKERS, len(pending))) as pool:
+            inflight = {}
+            it = iter(pending)
+            for _ in range(min(_COPY_WORKERS * 2, len(pending))):
+                rel, e, target = next(it)
+                inflight[pool.submit(_copy_one, e.path, target)] = (rel, e)
+            while inflight:
+                done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    rel, e = inflight.pop(fut)
+                    _on_copied(rel, e, fut.result())
+                    nxt = next(it, None)
+                    if nxt is not None:
+                        n_rel, n_e, n_target = nxt
+                        inflight[pool.submit(_copy_one, n_e.path, n_target)] = (n_rel, n_e)
+
     for rel, h in have.items():
         if rel not in want:
             h.path.unlink()
+            got.pop(rel, None)
             rep.removed += 1
-    got = {k: v.size for k, v in _walk(dst).items()}
     bad = [f"немає в копії: {k}" for k in want if k not in got]
     bad += [f"інший розмір: {k}" for k, e in want.items() if k in got and got[k] != e.size]
     if bad:
@@ -181,20 +303,28 @@ class ExportPlan:
     data_bytes: int = 0
     free_bytes: int = -1
     problems: list[str] = field(default_factory=list)
+    trees: dict[str, dict[str, _Entry]] = field(default_factory=dict, repr=False)
 
     @property
     def total_bytes(self) -> int:
         return self.workspace_bytes + self.roots_bytes + self.data_bytes
 
 
+def _tree_bytes(entries: dict[str, _Entry]) -> int:
+    return sum(max(e.size, 0) for e in entries.values())
+
+
 def _size(root: Path, skip_top: tuple[str, ...] = (), skip_rel: tuple[str, ...] = ()) -> int:
-    return sum(max(e.size, 0) for e in _walk(root, skip_top, skip_rel).values())
+    return _tree_bytes(_walk(root, skip_top, skip_rel))
 
 
 def plan_export(target: str | Path, *, with_roots: bool = False,
-                with_data: bool = False) -> ExportPlan:
+                with_data: bool = False,
+                echo: Callable[[str], None] | None = None,
+                progress: Callable[[str], None] | None = None) -> ExportPlan:
     """Порахувати експорт. Нічого не пише."""
     from nyshporka.core.appdirs import data_dir
+    from nyshporka.core.lock import LockBusy, check_busy
     from nyshporka.core.workspace import validate_root, workspace
     from nyshporka.setup.doctor import engine_venv
 
@@ -207,6 +337,11 @@ def plan_export(target: str | Path, *, with_roots: bool = False,
             (to / BUNDLE).is_file() or (to / WS_DIR).is_dir()):
         p.problems.append(f"{to} не порожня й не є копією простору — потрібна нова, "
                           f"порожня або тека попереднього експорту")
+    holder = check_busy(ws.hub)
+    if holder is not None:
+        p.problems.append(f"{LockBusy(holder)} Закрийте вікно Нишпорки (і `nysh serve`) "
+                          f"на час експорту.")
+        return p
     for i, root in enumerate(r for r in ws.extra_case_roots if r.is_dir()):
         if _inside(to, root) or _inside(root, to):
             p.problems.append(f"тека копії перетинається з коренем справ {root}")
@@ -217,11 +352,22 @@ def plan_export(target: str | Path, *, with_roots: bool = False,
         p.engines = engine_venv().is_dir() and _inside(engine_venv(), ws.hub)
     except Exception:
         p.engines = False
-    p.workspace_bytes = _size(ws.hub, WS_SKIP_TOP, WS_SKIP_REL)
-    p.roots_bytes = sum(_size(r) for r, d in p.roots if d)
+    ws_walk = _walk(ws.hub, WS_SKIP_TOP, WS_SKIP_REL,
+                    label=f"простір {ws.hub.name}", echo=echo, progress=progress)
+    p.trees[WS_DIR] = ws_walk
+    p.workspace_bytes = _tree_bytes(ws_walk)
+    for r, d in p.roots:
+        if d:
+            rw = _walk(r, label=f"корінь {r.name}", echo=echo, progress=progress)
+            p.trees[d] = rw
+            p.roots_bytes += _tree_bytes(rw)
     if with_data:
         p.data_from = data_dir()
-        p.data_bytes = sum(_size(p.data_from / part) for part in DATA_PARTS)
+        for part in DATA_PARTS:
+            dw = _walk(p.data_from / part, label=f"довідники {part}",
+                       echo=echo, progress=progress)
+            p.trees[f"{DATA_DIR}/{part}"] = dw
+            p.data_bytes += _tree_bytes(dw)
     present = _size(to) if to.is_dir() else 0
     probe = to
     while not probe.exists() and probe.parent != probe:
@@ -236,7 +382,8 @@ def plan_export(target: str | Path, *, with_roots: bool = False,
     return p
 
 
-def run_export(p: ExportPlan, echo: Callable[[str], None] = print) -> dict[str, Any]:
+def run_export(p: ExportPlan, echo: Callable[[str], None] = print, *,
+               progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Скопіювати простір (і, за планом, корені та довідники), паспорт — останнім."""
     from nyshporka import __version__
     from nyshporka.core.lock import LockBusy, WorkspaceLock
@@ -263,13 +410,17 @@ def run_export(p: ExportPlan, echo: Callable[[str], None] = print) -> dict[str, 
                             f"експорту.") from None
     echo(f"1. простір {p.workspace}")
     with lock:
-        take(WS_DIR, sync_tree(p.workspace, p.target / WS_DIR, WS_SKIP_TOP, WS_SKIP_REL))
+        take(WS_DIR, sync_tree(
+            p.workspace, p.target / WS_DIR, WS_SKIP_TOP, WS_SKIP_REL,
+            want=p.trees.get(WS_DIR), echo=echo, progress=progress, tick=lock.beat,
+        ))
 
     roots = [(r, d) for r, d in p.roots if d]
     if roots:
         echo("2. корені справ")
         for root, d in roots:
-            take(d, sync_tree(root, p.target / d))
+            take(d, sync_tree(root, p.target / d, want=p.trees.get(d),
+                               echo=echo, progress=progress))
     # Корені, яких цього разу не беруть, не мають лишатись у копії від минулого.
     old_roots = p.target / ROOTS_DIR
     if old_roots.is_dir():
@@ -280,8 +431,9 @@ def run_export(p: ExportPlan, echo: Callable[[str], None] = print) -> dict[str, 
         echo("3. довідники й ваги")
         for part in DATA_PARTS:
             if (p.data_from / part).is_dir():
-                take(f"{DATA_DIR}/{part}", sync_tree(p.data_from / part,
-                                                     p.target / DATA_DIR / part))
+                sec = f"{DATA_DIR}/{part}"
+                take(sec, sync_tree(p.data_from / part, p.target / sec,
+                                     want=p.trees.get(sec), echo=echo, progress=progress))
     elif (p.target / DATA_DIR).is_dir():
         shutil.rmtree(p.target / DATA_DIR)
 
@@ -321,6 +473,7 @@ class ImportPlan:
     roots_to: Path | None = None
     data_parts: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    source_walk: dict[str, _Entry] = field(default_factory=dict, repr=False)
 
 
 def read_bundle(source: Path) -> dict[str, Any]:
@@ -338,17 +491,27 @@ def read_bundle(source: Path) -> dict[str, Any]:
     return bundle
 
 
-def verify_copy(source: Path, bundle: dict[str, Any]) -> list[str]:
-    """Чого в копії бракує проти переліку з паспорта. Порожньо — зійшлось."""
+def _verify_walk(source: Path, bundle: dict[str, Any], *,
+                 echo: Callable[[str], None] | None = None,
+                 progress: Callable[[str], None] | None = None) -> tuple[list[str], dict[str, _Entry]]:
     want: dict[str, int] = bundle.get("files") or {}
-    got = {k: e.size for k, e in _walk(source).items()}
+    walked = _walk(source, label="звірка копії", echo=echo, progress=progress)
+    got = {k: e.size for k, e in walked.items()}
     bad = [f"немає: {k}" for k in want if _nfc(k) not in got]
     bad += [f"інший розмір: {k}" for k, v in want.items() if _nfc(k) in got and got[_nfc(k)] != v]
+    return bad, walked
+
+
+def verify_copy(source: Path, bundle: dict[str, Any]) -> list[str]:
+    """Чого в копії бракує проти переліку з паспорта. Порожньо — зійшлось."""
+    bad, _ = _verify_walk(source, bundle)
     return bad
 
 
 def plan_import(source: str | Path, dest: str | Path | None = None, *,
-                roots_to: str | Path | None = None) -> ImportPlan:
+                roots_to: str | Path | None = None,
+                echo: Callable[[str], None] | None = None,
+                progress: Callable[[str], None] | None = None) -> ImportPlan:
     """Порахувати імпорт. Нічого не пише."""
     from nyshporka import __version__
     from nyshporka.core.appdirs import data_dir
@@ -364,7 +527,8 @@ def plan_import(source: str | Path, dest: str | Path | None = None, *,
     if _key(made) > _key(__version__):
         p.problems.append(f"копію зроблено Нишпоркою {made}, а тут {__version__} — "
                           f"спершу `nysh update`")
-    bad = verify_copy(src, bundle)
+    bad, walked = _verify_walk(src, bundle, echo=echo, progress=progress)
+    p.source_walk = walked
     if bad:
         p.problems.append("копія не сходиться з переліком у паспорті:\n  "
                           + "\n  ".join(bad[:20]))
@@ -418,8 +582,17 @@ def _set_case_roots(marker: Path, roots: list[str]) -> None:
         text, f"case_roots = [{listed}]" if roots else None))
 
 
+def _subtree_walk(entries: dict[str, _Entry], prefix: str) -> dict[str, _Entry] | None:
+    if not entries:
+        return None
+    head = prefix + "/"
+    n = len(head)
+    return {rel[n:]: e for rel, e in entries.items() if rel.startswith(head)}
+
+
 def run_import(p: ImportPlan, *, runner: Runner = _run,
-               echo: Callable[[str], None] = print) -> list[str]:
+               echo: Callable[[str], None] = print,
+               progress: Callable[[str], None] | None = None) -> list[str]:
     """Розгорнути копію. Повертає, що лишилось зробити на цій машині руками."""
     from nyshporka.canon import hook as H
     from nyshporka.core import workspace as W
@@ -428,7 +601,9 @@ def run_import(p: ImportPlan, *, runner: Runner = _run,
     if p.problems:
         raise TransferError("\n".join(p.problems))
     echo(f"1. простір → {p.dest}")
-    rep = sync_tree(p.source / WS_DIR, p.dest)
+    rep = sync_tree(p.source / WS_DIR, p.dest,
+                    want=_subtree_walk(p.source_walk, WS_DIR),
+                    echo=echo, progress=progress)
     echo(f"  скопійовано {rep.copied} файлів ({human(rep.copied_bytes)})")
 
     moves = [m for m in p.roots if m.action == "copy"]
@@ -436,7 +611,9 @@ def run_import(p: ImportPlan, *, runner: Runner = _run,
         echo(f"2. корені справ → {p.roots_to}")
         for m in moves:
             assert m.new is not None and m.copied is not None
-            r = sync_tree(p.source / m.copied, m.new)
+            r = sync_tree(p.source / m.copied, m.new,
+                          want=_subtree_walk(p.source_walk, m.copied),
+                          echo=echo, progress=progress)
             echo(f"  {m.original} → {m.new}  ({r.copied} файлів)")
     # Відсутні корені лишаються в маркері: `nysh roots list` покаже їх із «теки
     # немає», а не сховає разом зі справами. Диск можуть підключити пізніше.
@@ -446,7 +623,9 @@ def run_import(p: ImportPlan, *, runner: Runner = _run,
 
     for part in p.data_parts:
         echo(f"3. {part} → {data_dir() / part}")
-        sync_tree(p.source / DATA_DIR / part, data_dir() / part)
+        sync_tree(p.source / DATA_DIR / part, data_dir() / part,
+                  want=_subtree_walk(p.source_walk, f"{DATA_DIR}/{part}"),
+                  echo=echo, progress=progress)
 
     hook = p.dest / ".git" / "hooks" / "pre-commit"
     if hook.is_file() and any(m in hook.read_text(encoding="utf-8", errors="replace")

@@ -970,6 +970,24 @@ workspace_app = typer.Typer(
 app.add_typer(workspace_app, name="workspace")
 
 
+def _transfer_progress(muted: bool = False):
+    """Живий рядок стану для TTY; у логах — лише стислий текстовий фолбек."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        def emit(msg: str) -> None:
+            console.print(f"[muted]{msg}[/muted]" if muted else msg)
+
+        if not console.is_terminal:
+            yield emit, None
+            return
+        with console.status("", spinner="dots") as st:
+            yield emit, lambda msg: st.update(f"[muted]{msg.strip()}[/muted]")
+
+    return _ctx()
+
+
 @workspace_app.command("export")
 @route("workspace export", tier="rare",
        when="перенести дослідження на іншу машину; регулярна копія на диск")
@@ -992,7 +1010,9 @@ def workspace_export_cmd(
     from nyshporka.setup import transfer as T
 
     try:
-        p = T.plan_export(target, with_roots=with_roots, with_data=with_data)
+        with _transfer_progress(muted=True) as (echo, progress):
+            p = T.plan_export(target, with_roots=with_roots, with_data=with_data,
+                              echo=echo, progress=progress)
     except WorkspaceError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
@@ -1016,7 +1036,8 @@ def workspace_export_cmd(
         console.print("[muted]це --dry-run: нічого не зроблено[/muted]")
         return
     try:
-        T.run_export(p, echo=console.print)
+        with _transfer_progress() as (echo, progress):
+            T.run_export(p, echo=echo, progress=progress)
     except T.TransferError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=1) from None
@@ -1046,7 +1067,9 @@ def workspace_import_cmd(
     from nyshporka.setup import transfer as T
 
     try:
-        p = T.plan_import(source, dest or None, roots_to=roots_to or None)
+        with _transfer_progress(muted=True) as (echo, progress):
+            p = T.plan_import(source, dest or None, roots_to=roots_to or None,
+                              echo=echo, progress=progress)
     except (WorkspaceError, T.TransferError) as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
@@ -1071,7 +1094,8 @@ def workspace_import_cmd(
     if not yes and not typer.confirm("Розгортаємо?", default=True):
         raise typer.Exit(code=1)
     try:
-        todo = T.run_import(p, echo=console.print)
+        with _transfer_progress() as (echo, progress):
+            todo = T.run_import(p, echo=echo, progress=progress)
     except T.TransferError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=1) from None

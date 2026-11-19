@@ -229,3 +229,86 @@ def test_cli_dry_runs_change_nothing(env: dict) -> None:
                                    "--dry-run"])
     assert res.exit_code == 0, res.output
     assert not env["new"].exists()
+
+
+def test_plan_export_fails_fast_when_workspace_is_locked(
+    env: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nyshporka.core import lock as L
+
+    with L.WorkspaceLock(env["ws"]).acquire():
+        monkeypatch.setattr(
+            T, "_walk",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("_walk should not run")),
+        )
+        p = T.plan_export(env["copy"])
+        assert any("простір уже відкрито" in msg for msg in p.problems)
+
+
+def test_export_reuses_cached_trees_and_reports_progress(
+    env: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanned: list[Path] = []
+    real_walk = T._walk
+
+    def spy_walk(root: Path, *args, **kwargs):
+        scanned.append(root)
+        return real_walk(root, *args, **kwargs)
+
+    monkeypatch.setattr(T, "_walk", spy_walk)
+    monkeypatch.setattr(T, "_COPY_PROGRESS_SEC", 0.0)
+    plan_lines: list[str] = []
+    p = T.plan_export(env["copy"], with_roots=True, echo=plan_lines.append)
+    assert T.WS_DIR in p.trees
+    assert any("✓" in line for line in plan_lines)
+
+    scanned.clear()
+    copy_lines: list[str] = []
+    T.run_export(p, echo=copy_lines.append)
+    assert env["ws"] not in scanned
+    assert env["scans"] not in scanned
+    assert any("1/1 файлів" in line for line in copy_lines)
+
+
+def test_import_reuses_cached_source_walk(
+    env: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _export(env, with_roots=True)
+    _as_new_machine(env, monkeypatch)
+    p = T.plan_import(env["copy"], env["new"])
+    assert p.source_walk
+
+    scanned: list[Path] = []
+    real_walk = T._walk
+
+    def spy_walk(root: Path, *args, **kwargs):
+        scanned.append(root)
+        return real_walk(root, *args, **kwargs)
+
+    monkeypatch.setattr(T, "_walk", spy_walk)
+    T.run_import(p, runner=lambda _c: 0, echo=lambda _s: None)
+    assert env["copy"] / "workspace" not in scanned
+
+
+def test_sync_tree_parallel_copy_skips_post_copy_rewalk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    for i in range(6):
+        (src / f"f{i}.bin").write_bytes(bytes([i + 1]) * (10 + i))
+
+    walk_calls: list[Path] = []
+    real_walk = T._walk
+
+    def spy_walk(root: Path, *args, **kwargs):
+        walk_calls.append(root)
+        return real_walk(root, *args, **kwargs)
+
+    monkeypatch.setattr(T, "_walk", spy_walk)
+    rep = T.sync_tree(src, dst, echo=lambda _s: None)
+    assert rep.copied == 6
+    assert walk_calls == [src, dst]
+    for i in range(6):
+        assert (dst / f"f{i}.bin").read_bytes() == bytes([i + 1]) * (10 + i)
