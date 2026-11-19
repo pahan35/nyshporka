@@ -93,7 +93,9 @@ def _format_eta(seconds: float) -> str:
 
 
 def _walk(root: Path, skip_top: tuple[str, ...] = (),
-          skip_rel: tuple[str, ...] = (), *, label: str = "",
+          skip_rel: tuple[str, ...] = (),
+          skip_fn: Callable[[str], bool] | None = None, *,
+          label: str = "",
           echo: Callable[[str], None] | None = None,
           progress: Callable[[str], None] | None = None) -> dict[str, _Entry]:
     """Кожен файл під `root`: NFC-шлях відносно `root` → запис."""
@@ -113,7 +115,7 @@ def _walk(root: Path, skip_top: tuple[str, ...] = (),
         for name in filenames:
             p = here / name
             rel = _nfc(p.relative_to(root).as_posix())
-            if rel in skip:
+            if rel in skip or (skip_fn is not None and skip_fn(rel)):
                 continue
             try:
                 st = p.stat()
@@ -162,6 +164,8 @@ def _copy_one(src_file: Path, dst_file: Path) -> int:
 def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
               skip_rel: tuple[str, ...] = (), *,
               want: dict[str, _Entry] | None = None,
+              prune: bool = True,
+              skip_fn: Callable[[str], bool] | None = None,
               echo: Callable[[str], None] = print,
               progress: Callable[[str], None] | None = None,
               tick: Callable[[], None] | None = None) -> SyncReport:
@@ -169,11 +173,11 @@ def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
 
     Незмінений файл (той самий розмір, mtime у межах `MTIME_SLACK`) не
     копіюється — повторний експорт на той самий диск коштує лише змінене.
-    Зайве знімається, бо інакше видалена картка воскресла б після імпорту.
+    Зайве знімається (коли `prune=True`), бо інакше видалена картка воскресла б після імпорту.
     Наприкінці — звірка пофайлово; не зійшлось — `TransferError`.
     """
     if want is None:
-        want = _walk(src, skip_top, skip_rel)
+        want = _walk(src, skip_top, skip_rel, skip_fn)
     have = _walk(dst)
     rep = SyncReport()
     # 🔴 Теки — теж, і порожні: git без `.git/refs` і `.git/objects` (вони
@@ -263,11 +267,12 @@ def sync_tree(src: Path, dst: Path, skip_top: tuple[str, ...] = (),
                         n_rel, n_e, n_target = nxt
                         inflight[pool.submit(_copy_one, n_e.path, n_target)] = (n_rel, n_e)
 
-    for rel, h in have.items():
-        if rel not in want:
-            h.path.unlink()
-            got.pop(rel, None)
-            rep.removed += 1
+    if prune:
+        for rel, h in have.items():
+            if rel not in want:
+                h.path.unlink()
+                got.pop(rel, None)
+                rep.removed += 1
     bad = [f"немає в копії: {k}" for k in want if k not in got]
     bad += [f"інший розмір: {k}" for k, e in want.items() if k in got and got[k] != e.size]
     if bad:
@@ -304,6 +309,9 @@ class ExportPlan:
     free_bytes: int = -1
     problems: list[str] = field(default_factory=list)
     trees: dict[str, dict[str, _Entry]] = field(default_factory=dict, repr=False)
+    scope: str = "full"
+    cases: list[str] = field(default_factory=list)
+    slices: list[tuple[Path, str, str]] = field(default_factory=list, repr=False)
 
     @property
     def total_bytes(self) -> int:
@@ -318,8 +326,71 @@ def _size(root: Path, skip_top: tuple[str, ...] = (), skip_rel: tuple[str, ...] 
     return _tree_bytes(_walk(root, skip_top, skip_rel))
 
 
+def _runs_for_case_dir(hub: Path, case_dir: Path) -> list[Path]:
+    htr_root = hub / "reports" / "htr"
+    if not htr_root.is_dir():
+        return []
+    norm = os.path.normcase(os.path.abspath(case_dir))
+    out: list[Path] = []
+    for d in sorted(htr_root.iterdir()):
+        meta_file = d / "_htr_meta.json"
+        if not d.is_dir() or not meta_file.is_file():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        cdir = str(meta.get("case_dir") or "")
+        if cdir and os.path.normcase(os.path.abspath(cdir)) == norm:
+            out.append(d)
+    return out
+
+
+def _resolve_case_for_export(hub: Path, spec: str) -> tuple[Path, list[Path], str]:
+    """Знайти теку справи та її HTR-прогони для `--case`."""
+    from nyshporka.cases import db
+    from nyshporka.core.workspace import WorkspaceError
+
+    raw = spec.strip()
+    if not raw:
+        raise WorkspaceError("порожній ідентифікатор справи для --case")
+    cand = Path(raw).expanduser()
+    if not cand.is_absolute():
+        cand = hub / cand
+    if cand.is_dir():
+        case_dir = Path(os.path.abspath(cand))
+        return case_dir, _runs_for_case_dir(hub, case_dir), case_dir.name
+
+    try:
+        rows = db.query_rows(q=raw, limit=50)
+        if not rows:
+            rows = [r for r in db.query_rows()
+                    if raw in (str(r.get("key") or ""), str(r.get("shifra") or ""))]
+    except Exception:
+        rows = []
+    exact = [r for r in rows if raw in (str(r.get("key") or ""), str(r.get("shifra") or ""))]
+    picked = exact if exact else rows
+    if not picked:
+        raise WorkspaceError(f"справу «{spec}» не знайдено")
+    if len(picked) > 1:
+        opts = ", ".join(f"{r.get('shifra') or r.get('key')} ({r.get('key')})" for r in picked[:5])
+        raise WorkspaceError(f"під «{spec}» підпадає кілька справ: {opts}")
+    row = picked[0]
+    p_str = str(row.get("path") or "")
+    case_dir = Path(os.path.abspath(Path(p_str) if Path(p_str).is_absolute() else hub / p_str))
+    if not case_dir.is_dir():
+        raise WorkspaceError(f"тека справи «{spec}» відсутня: {case_dir}")
+    runs = [hub / "reports" / "htr" / str(r) for r in (row.get("htr_runs") or [])
+            if (hub / "reports" / "htr" / str(r)).is_dir()]
+    if not runs:
+        runs = _runs_for_case_dir(hub, case_dir)
+    label = str(row.get("shifra") or row.get("key") or case_dir.name)
+    return case_dir, runs, label
+
+
 def plan_export(target: str | Path, *, with_roots: bool = False,
                 with_data: bool = False,
+                cases: list[str] | None = None,
                 echo: Callable[[str], None] | None = None,
                 progress: Callable[[str], None] | None = None) -> ExportPlan:
     """Порахувати експорт. Нічого не пише."""
@@ -334,7 +405,7 @@ def plan_export(target: str | Path, *, with_roots: bool = False,
     if _inside(to, ws.hub) or _inside(ws.hub, to):
         p.problems.append("тека копії не може лежати в просторі чи містити його")
     elif to.exists() and any(to.iterdir()) and not (
-            (to / BUNDLE).is_file() or (to / WS_DIR).is_dir()):
+            (to / BUNDLE).is_file() or (to / WS_DIR).is_dir() or (to / ROOTS_DIR).is_dir()):
         p.problems.append(f"{to} не порожня й не є копією простору — потрібна нова, "
                           f"порожня або тека попереднього експорту")
     holder = check_busy(ws.hub)
@@ -342,26 +413,62 @@ def plan_export(target: str | Path, *, with_roots: bool = False,
         p.problems.append(f"{LockBusy(holder)} Закрийте вікно Нишпорки (і `nysh serve`) "
                           f"на час експорту.")
         return p
-    for i, root in enumerate(r for r in ws.extra_case_roots if r.is_dir()):
-        if _inside(to, root) or _inside(root, to):
-            p.problems.append(f"тека копії перетинається з коренем справ {root}")
-        p.roots.append((root, f"{ROOTS_DIR}/{_root_dir_name(i + 1, root)}" if with_roots
-                        else None))
-    p.roots += [(r, None) for r in ws.extra_case_roots if not r.is_dir()]
+    if cases:
+        p.scope = "cases"
+        seen_rel: set[str] = set()
+        ext_idx = 0
+        for spec in cases:
+            case_dir, runs, label = _resolve_case_for_export(ws.hub, spec)
+            p.cases.append(label)
+            if _inside(case_dir, ws.hub):
+                rel = case_dir.relative_to(ws.hub).as_posix()
+                dst_rel = f"{WS_DIR}/{rel}"
+                if dst_rel not in seen_rel:
+                    seen_rel.add(dst_rel)
+                    p.slices.append((case_dir, dst_rel, f"справа ({label})"))
+            else:
+                if _inside(to, case_dir) or _inside(case_dir, to):
+                    p.problems.append(f"тека копії перетинається з коренем справ {case_dir}")
+                ext_idx += 1
+                dst_rel = f"{ROOTS_DIR}/{_root_dir_name(ext_idx, case_dir)}"
+                p.roots.append((case_dir, dst_rel))
+                if dst_rel not in seen_rel:
+                    seen_rel.add(dst_rel)
+                    p.slices.append((case_dir, dst_rel, f"корінь ({label})"))
+            for rdir in runs:
+                dst_rel = f"{WS_DIR}/reports/htr/{rdir.name}"
+                if dst_rel not in seen_rel:
+                    seen_rel.add(dst_rel)
+                    p.slices.append((rdir, dst_rel, f"прогін ({rdir.name})"))
+        ov_dir = ws.hub / "data" / "cases"
+        if (ov_dir / "overrides.json").is_file() and f"{WS_DIR}/data/cases" not in seen_rel:
+            p.slices.append((ov_dir, f"{WS_DIR}/data/cases", "прив'язки справ"))
+        p.workspace_bytes = sum(_size(src_dir) for src_dir, dst_rel, _ in p.slices
+                                if dst_rel.startswith(f"{WS_DIR}/"))
+        p.roots_bytes = sum(_size(src_dir) for src_dir, dst_rel, _ in p.slices
+                            if dst_rel.startswith(f"{ROOTS_DIR}/"))
+    else:
+        for i, root in enumerate(r for r in ws.extra_case_roots if r.is_dir()):
+            if _inside(to, root) or _inside(root, to):
+                p.problems.append(f"тека копії перетинається з коренем справ {root}")
+            p.roots.append((root, f"{ROOTS_DIR}/{_root_dir_name(i + 1, root)}" if with_roots
+                            else None))
+        p.roots += [(r, None) for r in ws.extra_case_roots if not r.is_dir()]
     try:
         p.engines = engine_venv().is_dir() and _inside(engine_venv(), ws.hub)
     except Exception:
         p.engines = False
-    ws_walk = _walk(ws.hub, WS_SKIP_TOP, WS_SKIP_REL,
-                    label=f"простір {ws.hub.name}", echo=echo, progress=progress)
-    p.trees[WS_DIR] = ws_walk
-    p.workspace_bytes = _tree_bytes(ws_walk)
-    for r, d in p.roots:
-        if d:
-            rw = _walk(r, label=f"корінь {r.name}", echo=echo, progress=progress)
-            p.trees[d] = rw
-            p.roots_bytes += _tree_bytes(rw)
-    if with_data:
+    if not cases:
+        ws_walk = _walk(ws.hub, WS_SKIP_TOP, WS_SKIP_REL,
+                        label=f"простір {ws.hub.name}", echo=echo, progress=progress)
+        p.trees[WS_DIR] = ws_walk
+        p.workspace_bytes = _tree_bytes(ws_walk)
+        for r, d in p.roots:
+            if d:
+                rw = _walk(r, label=f"корінь {r.name}", echo=echo, progress=progress)
+                p.trees[d] = rw
+                p.roots_bytes += _tree_bytes(rw)
+    if with_data and not cases:
         p.data_from = data_dir()
         for part in DATA_PARTS:
             dw = _walk(p.data_from / part, label=f"довідники {part}",
@@ -410,38 +517,50 @@ def run_export(p: ExportPlan, echo: Callable[[str], None] = print, *,
                             f"експорту.") from None
     echo(f"1. простір {p.workspace}")
     with lock:
-        take(WS_DIR, sync_tree(
-            p.workspace, p.target / WS_DIR, WS_SKIP_TOP, WS_SKIP_REL,
-            want=p.trees.get(WS_DIR), echo=echo, progress=progress, tick=lock.beat,
-        ))
+        if p.scope == "cases":
+            for src_dir, dst_rel, label in p.slices:
+                echo(label)
+                take(dst_rel, sync_tree(
+                    src_dir, p.target / dst_rel,
+                    want=p.trees.get(dst_rel), echo=echo, progress=progress,
+                    tick=lock.beat,
+                ))
+        else:
+            take(WS_DIR, sync_tree(
+                p.workspace, p.target / WS_DIR, WS_SKIP_TOP, WS_SKIP_REL,
+                want=p.trees.get(WS_DIR), echo=echo, progress=progress, tick=lock.beat,
+            ))
 
-    roots = [(r, d) for r, d in p.roots if d]
-    if roots:
-        echo("2. корені справ")
-        for root, d in roots:
-            take(d, sync_tree(root, p.target / d, want=p.trees.get(d),
-                               echo=echo, progress=progress))
-    # Корені, яких цього разу не беруть, не мають лишатись у копії від минулого.
-    old_roots = p.target / ROOTS_DIR
-    if old_roots.is_dir():
-        for sub in old_roots.iterdir():
-            if f"{ROOTS_DIR}/{sub.name}" not in {d for _, d in roots}:
-                shutil.rmtree(sub)
-    if p.data_from is not None:
-        echo("3. довідники й ваги")
-        for part in DATA_PARTS:
-            if (p.data_from / part).is_dir():
-                sec = f"{DATA_DIR}/{part}"
-                take(sec, sync_tree(p.data_from / part, p.target / sec,
-                                     want=p.trees.get(sec), echo=echo, progress=progress))
-    elif (p.target / DATA_DIR).is_dir():
-        shutil.rmtree(p.target / DATA_DIR)
+    if p.scope != "cases":
+        roots = [(r, d) for r, d in p.roots if d]
+        if roots:
+            echo("2. корені справ")
+            for root, d in roots:
+                take(d, sync_tree(root, p.target / d, want=p.trees.get(d),
+                                   echo=echo, progress=progress))
+        # Корені, яких цього разу не беруть, не мають лишатись у копії від минулого.
+        old_roots = p.target / ROOTS_DIR
+        if old_roots.is_dir():
+            for sub in old_roots.iterdir():
+                if f"{ROOTS_DIR}/{sub.name}" not in {d for _, d in roots}:
+                    shutil.rmtree(sub)
+        if p.data_from is not None:
+            echo("3. довідники й ваги")
+            for part in DATA_PARTS:
+                if (p.data_from / part).is_dir():
+                    sec = f"{DATA_DIR}/{part}"
+                    take(sec, sync_tree(p.data_from / part, p.target / sec,
+                                         want=p.trees.get(sec), echo=echo, progress=progress))
+        elif (p.target / DATA_DIR).is_dir():
+            shutil.rmtree(p.target / DATA_DIR)
 
     bundle = {
         "format": FORMAT,
         "nyshporka": __version__,
         "platform": sys.platform,
         "created": datetime.now(UTC).isoformat(timespec="seconds"),
+        "scope": p.scope,
+        "cases": p.cases,
         "source": str(p.workspace),
         "engines": p.engines,
         "roots": [{"original": str(r).replace("\\", "/"), "dir": d} for r, d in p.roots],
@@ -474,6 +593,7 @@ class ImportPlan:
     data_parts: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
     source_walk: dict[str, _Entry] = field(default_factory=dict, repr=False)
+    update: bool = False
 
 
 def read_bundle(source: Path) -> dict[str, Any]:
@@ -510,19 +630,30 @@ def verify_copy(source: Path, bundle: dict[str, Any]) -> list[str]:
 
 def plan_import(source: str | Path, dest: str | Path | None = None, *,
                 roots_to: str | Path | None = None,
+                update: bool = False,
                 echo: Callable[[str], None] | None = None,
                 progress: Callable[[str], None] | None = None) -> ImportPlan:
     """Порахувати імпорт. Нічого не пише."""
     from nyshporka import __version__
     from nyshporka.core.appdirs import data_dir
-    from nyshporka.core.workspace import validate_root
+    from nyshporka.core.lock import LockBusy, read as read_lock
+    from nyshporka.core.workspace import WorkspaceError, validate_root, workspace
     from nyshporka.setup.update import _key
     from nyshporka.setup.wizard import _is_synced, default_root
 
     src = Path(source).expanduser().resolve()
     bundle = read_bundle(src)
-    to = validate_root(Path(dest) if dest else default_root())
-    p = ImportPlan(source=src, dest=to, bundle=bundle)
+    is_update = bool(update or bundle.get("scope") == "cases")
+    if dest:
+        to = validate_root(Path(dest))
+    elif is_update:
+        try:
+            to = workspace().hub
+        except WorkspaceError:
+            to = validate_root(default_root())
+    else:
+        to = validate_root(default_root())
+    p = ImportPlan(source=src, dest=to, bundle=bundle, update=is_update)
     made = str(bundle.get("nyshporka") or "0")
     if _key(made) > _key(__version__):
         p.problems.append(f"копію зроблено Нишпоркою {made}, а тут {__version__} — "
@@ -536,8 +667,15 @@ def plan_import(source: str | Path, dest: str | Path | None = None, *,
         p.problems.append(f"{to} синхронізується з хмарою — оберіть теку поза нею")
     if _inside(to, src) or _inside(src, to):
         p.problems.append("простір не може лежати в копії чи містити її")
+    elif is_update:
+        if to.is_dir():
+            holder = read_lock(to)
+            if holder is not None and not holder.is_stale():
+                p.problems.append(f"{LockBusy(holder)} Закрийте вікно Нишпорки (і `nysh serve`) "
+                                  f"на час оновлення.")
     elif to.exists() and any(to.iterdir()):
-        p.problems.append(f"{to} не порожня — потрібна нова або порожня тека")
+        p.problems.append(f"{to} не порожня — потрібна нова або порожня тека "
+                          f"(або `--update`, щоб долити зміни)")
 
     p.roots_to = (Path(roots_to).expanduser() if roots_to
                   else to.parent / f"{to.name}-скани")
@@ -552,7 +690,7 @@ def plan_import(source: str | Path, dest: str | Path | None = None, *,
             p.roots.append(RootMove(original, "keep", here))
         elif copied and (src / copied).is_dir():
             new = p.roots_to / Path(copied).name
-            if new.exists() and any(new.iterdir()):
+            if not is_update and new.exists() and any(new.iterdir()):
                 p.problems.append(f"{new} уже існує й не порожня — назвіть іншу теку "
                                   f"`--roots-to`")
             p.roots.append(RootMove(original, "copy", new, copied))
@@ -590,6 +728,35 @@ def _subtree_walk(entries: dict[str, _Entry], prefix: str) -> dict[str, _Entry] 
     return {rel[n:]: e for rel, e in entries.items() if rel.startswith(head)}
 
 
+def _merge_overrides(src_file: Path, dst_file: Path) -> None:
+    if not src_file.is_file():
+        return
+    try:
+        incoming = json.loads(src_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(incoming, dict):
+        return
+    existing: dict[str, Any] = {}
+    if dst_file.is_file():
+        try:
+            loaded = json.loads(dst_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            pass
+    from nyshporka.utils.atomic import atomic_write_text
+
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(dst_file, json.dumps({**existing, **incoming}, ensure_ascii=False, indent=2))
+
+
+def _skip_update_rel(rel: str, marker: str) -> bool:
+    if rel == marker or rel.startswith(".venv") or rel == "data/cases/overrides.json":
+        return True
+    return rel.startswith("data/derived/") and ".sqlite" in rel
+
+
 def run_import(p: ImportPlan, *, runner: Runner = _run,
                echo: Callable[[str], None] = print,
                progress: Callable[[str], None] | None = None) -> list[str]:
@@ -601,9 +768,20 @@ def run_import(p: ImportPlan, *, runner: Runner = _run,
     if p.problems:
         raise TransferError("\n".join(p.problems))
     echo(f"1. простір → {p.dest}")
-    rep = sync_tree(p.source / WS_DIR, p.dest,
-                    want=_subtree_walk(p.source_walk, WS_DIR),
-                    echo=echo, progress=progress)
+    if p.update:
+        want_ws = _subtree_walk(p.source_walk, WS_DIR)
+        if want_ws is not None:
+            want_ws = {rel: e for rel, e in want_ws.items()
+                       if not _skip_update_rel(rel, W.MARKER)}
+        rep = sync_tree(p.source / WS_DIR, p.dest, want=want_ws, prune=False,
+                        skip_fn=lambda rel: _skip_update_rel(rel, W.MARKER),
+                        echo=echo, progress=progress)
+        _merge_overrides(p.source / WS_DIR / "data" / "cases" / "overrides.json",
+                         p.dest / "data" / "cases" / "overrides.json")
+    else:
+        rep = sync_tree(p.source / WS_DIR, p.dest,
+                        want=_subtree_walk(p.source_walk, WS_DIR),
+                        echo=echo, progress=progress)
     echo(f"  скопійовано {rep.copied} файлів ({human(rep.copied_bytes)})")
 
     moves = [m for m in p.roots if m.action == "copy"]
@@ -613,13 +791,19 @@ def run_import(p: ImportPlan, *, runner: Runner = _run,
             assert m.new is not None and m.copied is not None
             r = sync_tree(p.source / m.copied, m.new,
                           want=_subtree_walk(p.source_walk, m.copied),
+                          prune=not p.update,
                           echo=echo, progress=progress)
             echo(f"  {m.original} → {m.new}  ({r.copied} файлів)")
-    # Відсутні корені лишаються в маркері: `nysh roots list` покаже їх із «теки
-    # немає», а не сховає разом зі справами. Диск можуть підключити пізніше.
-    final = [str(m.new).replace("\\", "/") if m.action != "missing" and m.new is not None
-             else m.original for m in p.roots]
-    _set_case_roots(p.dest / W.MARKER, final)
+    if p.update:
+        for m in moves:
+            if m.new is not None:
+                W.add_case_root(p.dest, m.new)
+    else:
+        # Відсутні корені лишаються в маркері: `nysh roots list` покаже їх із «теки
+        # немає», а не сховає разом зі справами. Диск можуть підключити пізніше.
+        final = [str(m.new).replace("\\", "/") if m.action != "missing" and m.new is not None
+                 else m.original for m in p.roots]
+        _set_case_roots(p.dest / W.MARKER, final)
 
     for part in p.data_parts:
         echo(f"3. {part} → {data_dir() / part}")
@@ -627,13 +811,14 @@ def run_import(p: ImportPlan, *, runner: Runner = _run,
                   want=_subtree_walk(p.source_walk, f"{DATA_DIR}/{part}"),
                   echo=echo, progress=progress)
 
-    hook = p.dest / ".git" / "hooks" / "pre-commit"
-    if hook.is_file() and any(m in hook.read_text(encoding="utf-8", errors="replace")
-                              for m in H.MARKERS):
-        H.install(p.dest)
-        echo("  хук канону — з інтерпретатором цієї машини")
+    if not p.update:
+        hook = p.dest / ".git" / "hooks" / "pre-commit"
+        if hook.is_file() and any(m in hook.read_text(encoding="utf-8", errors="replace")
+                                  for m in H.MARKERS):
+            H.install(p.dest)
+            echo("  хук канону — з інтерпретатором цієї машини")
 
-    W.state_set(workspace=str(p.dest))
+        W.state_set(workspace=str(p.dest))
     me = [sys.executable, "-m", "nyshporka", "--workspace", str(p.dest)]
     echo("4. реєстр справ")
     if runner([*me, "cases", "build"]) != 0:

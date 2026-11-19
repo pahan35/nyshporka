@@ -997,6 +997,8 @@ def workspace_export_cmd(
                                     help="узяти й теки зі сканами поза простором"),
     with_data: bool = typer.Option(False, "--with-data",
                                    help="узяти довідники й ваги — для машини без мережі"),
+    case: list[str] = typer.Option([], "--case",
+                                   help="лише вказана справа (шифра, ключ або тека); можна кілька"),
     dry_run: bool = typer.Option(False, "--dry-run", help="лише показати план"),
 ) -> None:
     """Скопіювати простір на диск, щоб розгорнути на іншій машині.
@@ -1012,12 +1014,13 @@ def workspace_export_cmd(
     try:
         with _transfer_progress(muted=True) as (echo, progress):
             p = T.plan_export(target, with_roots=with_roots, with_data=with_data,
-                              echo=echo, progress=progress)
+                              cases=case or None, echo=echo, progress=progress)
     except WorkspaceError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
     console.print(f"простір:  {p.workspace} → [bold]{p.target}[/bold]  "
-                  f"[muted]{R.human(p.workspace_bytes)}[/muted]")
+                  + (f"[muted](справи: {', '.join(p.cases)})[/muted]  " if p.cases else "")
+                  + f"[muted]{R.human(p.workspace_bytes)}[/muted]")
     for root, d in p.roots:
         state = (f"→ {d}" if d else
                  "[warn]теки немає[/warn]" if not root.is_dir() else
@@ -1054,6 +1057,8 @@ def workspace_import_cmd(
     dest: str = typer.Argument("", help="куди розгорнути простір; порожньо — тека за замовчуванням"),
     roots_to: str = typer.Option("", "--roots-to",
                                  help="куди покласти теки зі сканами з копії"),
+    update: bool = typer.Option(False, "--update",
+                                help="долити зміни в наявний простір (не затираючи решту)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="лише показати план"),
     yes: bool = typer.Option(False, "--yes", "-y", help="не питати"),
 ) -> None:
@@ -1069,7 +1074,7 @@ def workspace_import_cmd(
     try:
         with _transfer_progress(muted=True) as (echo, progress):
             p = T.plan_import(source, dest or None, roots_to=roots_to or None,
-                              echo=echo, progress=progress)
+                              update=update, echo=echo, progress=progress)
     except (WorkspaceError, T.TransferError) as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None

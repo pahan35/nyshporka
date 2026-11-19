@@ -312,3 +312,62 @@ def test_sync_tree_parallel_copy_skips_post_copy_rewalk(
     assert walk_calls == [src, dst]
     for i in range(6):
         assert (dst / f"f{i}.bin").read_bytes() == bytes([i + 1]) * (10 + i)
+
+
+def test_case_scoped_export_and_incremental_import(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws: Path = env["ws"]
+    other_case = ws / "data" / "raw" / "other-case"
+    other_case.mkdir(parents=True)
+    (other_case / "001.jpg").write_bytes(b"other")
+
+    run_dir = ws / "reports" / "htr" / "run-spr-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "_htr_meta.json").write_text(
+        json.dumps({"case_dir": str(ws / "data" / "raw" / "spr-1")}), encoding="utf-8",
+    )
+    (run_dir / "001.txt").write_text("decoded", encoding="utf-8")
+
+    ov_dir = ws / "data" / "cases"
+    ov_dir.mkdir(parents=True, exist_ok=True)
+    (ov_dir / "overrides.json").write_text(json.dumps({"spr-1": {"shifra": "1-1-1"}}), encoding="utf-8")
+
+    bundle = T.run_export(T.plan_export(env["copy"], cases=["data/raw/spr-1"]), echo=lambda _s: None)
+    assert bundle["scope"] == "cases"
+    assert (env["copy"] / "workspace" / "data" / "raw" / "spr-1" / "0001.jpg").is_file()
+    assert (env["copy"] / "workspace" / "reports" / "htr" / "run-spr-1" / "001.txt").is_file()
+    assert not (env["copy"] / "workspace" / "data" / "raw" / "other-case").exists()
+
+    target_ws = env["new"]
+    target_ws.mkdir(parents=True)
+    (target_ws / ".nyshporka.toml").write_text("[workspace]\n", encoding="utf-8")
+    keep_file = target_ws / "data" / "raw" / "existing" / "001.jpg"
+    keep_file.parent.mkdir(parents=True)
+    keep_file.write_bytes(b"keep")
+    t_ov = target_ws / "data" / "cases" / "overrides.json"
+    t_ov.parent.mkdir(parents=True, exist_ok=True)
+    t_ov.write_text(json.dumps({"existing": {"shifra": "9-9-9"}}), encoding="utf-8")
+
+    _as_new_machine(env, monkeypatch)
+    plan = T.plan_import(env["copy"], target_ws)
+    assert plan.update is True
+    assert not plan.problems
+    T.run_import(plan, runner=lambda c: 0, echo=lambda _s: None)
+
+    assert keep_file.read_bytes() == b"keep"
+    assert (target_ws / "data" / "raw" / "spr-1" / "0001.jpg").read_bytes() == b"x" * 100
+    assert (target_ws / "reports" / "htr" / "run-spr-1" / "001.txt").read_text(encoding="utf-8") == "decoded"
+    merged = json.loads(t_ov.read_text(encoding="utf-8"))
+    assert merged == {"existing": {"shifra": "9-9-9"}, "spr-1": {"shifra": "1-1-1"}}
+
+
+def test_case_lookup_uses_db_query_rows(env: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nyshporka.cases import db
+
+    ws: Path = env["ws"]
+    c_dir = ws / "data" / "raw" / "spr-1"
+    monkeypatch.setattr(db, "query_rows", lambda **kw: [
+        {"key": "CDIAK/1/1/1", "shifra": "ЦДІАК 1-1-1", "path": str(c_dir), "htr_runs": []},
+    ])
+    resolved, _runs, label = T._resolve_case_for_export(ws, "ЦДІАК 1-1-1")
+    assert resolved == c_dir.resolve()
+    assert label == "ЦДІАК 1-1-1"
