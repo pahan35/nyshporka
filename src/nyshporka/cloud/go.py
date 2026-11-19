@@ -353,6 +353,30 @@ def _kadry_z_pdf(d: Path, on_line: Any = None, *, dry: bool = False) -> None:
     pdfpage.vytiahnuty_kadry(d, on_line=on_line)
 
 
+def _passport_key(frames_dir: Path) -> str:
+    """Ключ із паспорта теки (`_source.json`: шифра, далі `case_key`) або ""."""
+    from nyshporka.cases.resolve import normalize_key
+
+    bases = (frames_dir, frames_dir.parent) if frames_dir.name == "pages" else (frames_dir,)
+    for base in bases:
+        p = base / "_source.json"
+        if not p.is_file():
+            continue
+        try:
+            src = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(src, dict):
+            return ""
+        for raw in (src.get("shifra"), src.get("case_key")):
+            if raw:
+                made, _why = normalize_key(str(raw))
+                if made:
+                    return str(made)
+        return ""
+    return ""
+
+
 def resolve_case(arg: str, on_line: Any = None, *, dry: bool = False) -> CaseRef:
     """Тека кадрів або шифра → `CaseRef`. `on_line` — рядки розгортання PDF.
 
@@ -382,6 +406,15 @@ def resolve_case(arg: str, on_line: Any = None, *, dry: bool = False) -> CaseRef
                     key = ""
                 if key:
                     break
+            # 🔴 Ключ, угаданий з імені теки, може прийти з ЧУЖОГО архіву: коли
+            # справи паспорта бібліотека ще не знає (паспорт щойно записано),
+            # `_pick` бере кандидата будь-якого архіву з тим самим фондом і
+            # номером. ЦДІАК 2-1-31 і 2-1-33 (19.11.2026) так поїхали в хмару
+            # під ключами ANRM/2/2/31 і /33, і текст ліг під молдовську справу.
+            # Паспорт теки називає архів сам — йому й вирішувати.
+            pas = _passport_key(d)
+            if key and pas and key.split("/")[0] != pas.split("/")[0]:
+                key = index.canonical(pas) or ""
             expected = int((index.by_key.get(key) or {}).get("frames") or 0)
         return CaseRef(frames_dir=d, key=key, frames_expected=expected)
 
@@ -679,7 +712,21 @@ class _Density:
 
         series = F.series_of(key) if self.batch else None
         if series is None:
-            return probe()
+            got = probe()
+            if got is not None:
+                return got
+            # 🔴 Вибірці нема з чого міряти (кадри лише в R2 — маніфест без jpg):
+            # без цього наглядач брав типові 60 рядк/стор і вдвічі занижував
+            # темп. ЦДІАК 2-1-22 (19.11.2026): припущено 60, сусіди опису — 38,
+            # прогноз 4 962 стор/год проти факту 7 716. Сусіди хибять на
+            # нетиповій справі, але менше за сліпе типове число.
+            near = F.neighbour_lines_per_page(key)
+            if near is None:
+                return None
+            lines, n = near
+            say("density", f"щільність {lines:g} рядк/стор — вибірки зробити не вдалось, "
+                           f"медіана {n} прочитаних справ того самого опису")
+            return lines
         near = F.neighbour_lines_per_page(key)
         if near is not None:
             lines, n = near

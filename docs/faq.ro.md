@@ -144,22 +144,17 @@ dumneavoastră (`nysh share setup`).
 
 ### Se poate muta cercetarea pe alt calculator?
 
-Da. Directorul de lucru este un director obișnuit, iar descrierea fiecărui
-dosar se află în directorul dosarului însuși, așa că se mută împreună cu el,
-inclusiv la un coleg. Mai sigur este printr-un pachet, de exemplu pe un disc
-extern:
-
-1. pe calculatorul vechi închideți fereastra Nyshporka și rulați
-   `nysh workspace export E:/Nyshporka-mutare --with-roots`
-   (`--with-roots` adaugă dosarele ținute în afara spațiului de lucru,
-   `--with-data` — cataloagele de referință și ponderile modelelor);
-2. pe cel nou, după instalarea Nyshporka, `nysh workspace import E:/Nyshporka-mutare`.
-
-Importul verifică dacă pachetul este complet și intact, rescrie căile spre
-dosare și hook-ul istoricului pentru noul calculator, iar la final spune ce a
-rămas de făcut manual: construirea motoarelor de citire (`nysh htr install`),
-autentificarea în Supriaha. Un nou export în același director copiază doar ce
-s-a schimbat.
+Da. Pe calculatorul vechi închideți fereastra Nyshporka și rulați
+`nysh workspace export <director pe un disc>`: copia este verificată fișier cu
+fișier, iar o nouă rulare în același director copiază doar ce s-a schimbat.
+`--with-roots` adaugă directoarele cu scanări aflate în afara spațiului de
+lucru, `--with-data` — cataloagele și ponderile modelelor pentru un calculator
+fără internet. Pe calculatorul nou instalați Nyshporka și rulați
+`nysh workspace import <directorul copiei>`: spațiul este refăcut, directoarele
+cu scanări ajung în noile locuri, iar comanda spune ce a mai rămas de făcut
+(motoarele de citire, autentificarea în Supriaha). Descrierea fiecărui dosar se
+află în directorul dosarului însuși, așa că un singur dosar poate fi dat în
+continuare unui coleg printr-o simplă copie a directorului.
 
 ## Actualizare și dezinstalare
 

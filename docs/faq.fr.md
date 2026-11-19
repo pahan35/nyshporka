@@ -151,23 +151,17 @@ c'est vous qui les activez (`nysh share setup`).
 
 ### Peut-on transférer une recherche sur un autre ordinateur ?
 
-Oui. Le répertoire de travail est un répertoire ordinaire, et la description de
-chaque dossier se trouve dans le répertoire du dossier lui-même : elle voyage
-avec lui, y compris chez un collègue. Le plus sûr est de passer par un paquet,
-par exemple sur un disque externe :
-
-1. sur l'ancienne machine, fermez la fenêtre de Nyshporka et lancez
-   `nysh workspace export E:/Nyshporka-transfert --with-roots`
-   (`--with-roots` ajoute les dossiers rangés hors de l'espace de travail,
-   `--with-data` les référentiels et les poids des modèles) ;
-2. sur la nouvelle, une fois Nyshporka installée,
-   `nysh workspace import E:/Nyshporka-transfert`.
-
-L'import vérifie que le paquet est complet et intact, réécrit les chemins des
-dossiers et le hook de l'historique pour la nouvelle machine, puis indique ce
-qui reste à faire à la main : construire les moteurs de lecture
-(`nysh htr install`), se connecter à Supriaha. Un nouvel export dans le même
-répertoire ne copie que ce qui a changé.
+Oui. Sur l'ancienne machine, fermez la fenêtre de Nyshporka et lancez
+`nysh workspace export <répertoire sur un disque>` : la copie est vérifiée
+fichier par fichier, et un nouveau lancement vers le même répertoire ne copie
+que ce qui a changé. `--with-roots` ajoute les répertoires de scans situés hors
+de l'espace de travail, `--with-data` les référentiels et les poids des modèles
+pour une machine sans Internet. Sur la nouvelle machine, installez Nyshporka et
+lancez `nysh workspace import <répertoire de la copie>` : l'espace est restauré,
+les répertoires de scans rejoignent leurs nouveaux emplacements, et la commande
+indique ce qu'il reste à faire (moteurs de lecture, connexion à Supriaha). La
+description de chaque dossier se trouve dans le répertoire du dossier lui-même :
+un dossier isolé peut toujours être transmis à un collègue par simple copie.
 
 ## Mise à jour et suppression
 

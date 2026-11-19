@@ -135,20 +135,15 @@ you switch them on (`nysh share setup`).
 
 ### Can I move my research to another computer?
 
-Yes. The working folder is an ordinary folder, and the description of each file lives in that
-file's own folder, so it moves along with it, including to a colleague. The reliable way is a
-bundle, for example on an external drive:
-
-1. on the old machine, close the Nyshporka window and run
-   `nysh workspace export E:/Nyshporka-move --with-roots`
-   (`--with-roots` adds files kept outside the workspace; `--with-data` adds the reference
-   catalogs and model weights);
-2. on the new one, after installing Nyshporka, run `nysh workspace import E:/Nyshporka-move`.
-
-The import checks that the bundle is complete and intact, rewrites the paths to your files and
-the history hook for the new machine, and at the end lists what is left to do by hand: build
-the reading engines (`nysh htr install`), sign in to Supriaha. Exporting again into the same
-folder copies only what changed.
+Yes. On the old machine close the Nyshporka window and run
+`nysh workspace export <folder on a disk>`: the copy is verified file by file, and running it
+again into the same folder copies only what changed. `--with-roots` adds scan folders kept
+outside the workspace, `--with-data` adds reference packs and model weights for a machine
+without internet. On the new machine install Nyshporka and run
+`nysh workspace import <copy folder>`: the workspace is restored, scan folders move to their
+new places, and the command lists what is left to do (reading engines, signing in to
+Supriaha). The description of each file lives in that file's own folder, so a single file
+can still be handed to a colleague as a plain folder copy.
 
 ## Updating and uninstalling
 

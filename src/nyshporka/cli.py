@@ -133,10 +133,7 @@ def _sync_skills() -> None:
 
 #: Команди, перед якими скіли не чіпаються: їхній процес живе довго або
 #: спілкується протоколом, і побічна робота на старті тут недоречна.
-#: ⚠ `workspace` — бо експорт й імпорт свідомо запускають і з теки з кодом поруч
-#: зі встановленою Нишпоркою. Синхронізація з такого запуску переписала б хуки
-#: помічника цієї машини на інтерпретатор клону, і вони зламались би разом із ним.
-_NO_SKILL_SYNC_FOR = frozenset({"mcp", "serve", "workspace"})
+_NO_SKILL_SYNC_FOR = frozenset({"mcp", "serve"})
 
 #: Де нагадування про міграцію агента зайве: сама міграція, створення простору.
 _NO_MIGRATION_NAG_FOR = frozenset({"migrate", "init", "mcp", "serve", "version"})
@@ -968,96 +965,53 @@ def relocate(
 
 
 workspace_app = typer.Typer(
-    help="Перенести простір на інший комп'ютер: пакунок на диску (`export` → `import`).",
+    help="Перенести простір на іншу машину: копія на диск і розгортання з неї.",
     no_args_is_help=True)
 app.add_typer(workspace_app, name="workspace")
 
 
-def _transfer_progress(muted: bool = False):
-    """Живий рядок стану для TTY; у логах — лише стислий текстовий фолбек."""
-    from contextlib import contextmanager
-
-    @contextmanager
-    def _ctx():
-        def emit(msg: str) -> None:
-            console.print(f"[muted]{msg}[/muted]" if muted else msg)
-
-        if not console.is_terminal:
-            yield emit, None
-            return
-        with console.status("", spinner="dots") as st:
-            yield emit, lambda msg: st.update(f"[muted]{msg.strip()}[/muted]")
-
-    return _ctx()
-
-
 @workspace_app.command("export")
 @route("workspace export", tier="rare",
-       when="людина переносить дослідження на інший комп'ютер чи зовнішній диск")
-def workspace_export(
-    dest: str = typer.Argument(..., help="тека пакунка, напр. /Volumes/Диск/Нишпорка-перенос"),
+       when="перенести дослідження на іншу машину; регулярна копія на диск")
+def workspace_export_cmd(
+    target: str = typer.Argument(..., help="тека копії, напр. E:/Нишпорка-копія"),
     with_roots: bool = typer.Option(False, "--with-roots",
-                                    help="покласти й корені справ поза простором (case_roots)"),
+                                    help="узяти й теки зі сканами поза простором"),
     with_data: bool = typer.Option(False, "--with-data",
-                                   help="покласти й довідники та ваги моделей"),
-    agent_memory: bool = typer.Option(True, "--agent-memory/--no-agent-memory",
-                                      help="пам'ять помічника про цей простір"),
+                                   help="узяти довідники й ваги — для машини без мережі"),
     case: list[str] = typer.Option([], "--case",
                                    help="лише вказана справа (шифра, ключ або тека); можна кілька"),
     dry_run: bool = typer.Option(False, "--dry-run", help="лише показати план"),
 ) -> None:
-    """Покласти простір у пакунок для іншої машини (простір не змінюється).
+    """Скопіювати простір на диск, щоб розгорнути на іншій машині.
 
-    Пакунок повний лише тоді, коли в ньому з'явився `nyshporka-bundle.json`;
-    повторний експорт у ту саму теку докопійовує лише змінене.
+    Копія звіряється пофайлово; повторний експорт у ту саму теку докопійовує
+    лише змінене. Середовище рушіїв не копіюється — на новій машині його
+    збирає `nysh htr install`.
     """
     from nyshporka.core.workspace import WorkspaceError
+    from nyshporka.setup import relocate as R
     from nyshporka.setup import transfer as T
 
     try:
-        with _transfer_progress(muted=True) as (echo, progress):
-            p = T.plan_export(
-                dest,
-                with_roots=with_roots,
-                with_data=with_data,
-                with_memory=agent_memory,
-                cases=case or None,
-                echo=echo,
-                progress=progress,
-            )
+        p = T.plan_export(target, with_roots=with_roots, with_data=with_data,
+                          cases=case or None)
     except WorkspaceError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
-    console.print(f"простір:  {p.source}  [muted]{T.human(p.ws_bytes)}[/muted]")
-    console.print(f"пакунок:  [bold]{p.dest}[/bold]"
-                  + ("  [muted](оновлюю наявний)[/muted]" if p.refresh else "")
-                  + (f"  [muted](справи: {', '.join(p.cases)})[/muted]" if p.cases else "")
-                  + (f"  [muted]{p.fs}[/muted]" if p.fs else ""))
-    for r in p.roots:
-        if r.inside:
-            continue
-        if r.slot:
-            console.print(f"корінь:   {r.path} → {r.slot}  [muted]{T.human(r.bytes)}[/muted]")
-        elif not r.exists:
-            console.print(f"[warn]корінь:   {r.path} — на цій машині його немає, "
-                          f"не кладу[/warn]")
-        else:
-            console.print(f"[warn]корінь:   {r.path} — не кладу (додайте --with-roots або "
-                          f"перенесіть диск)[/warn]")
-    for name, src in p.data.items():
-        console.print(f"дані:     {name} ← {src}")
-    for key in p.memory:
-        console.print(f"пам'ять:  {key}")
-    if p.engines:
-        console.print("[muted]рушії читання не кладу: на новій машині — `nysh htr install`"
-                      "[/muted]")
-    for link in p.links[:5]:
-        console.print(f"[warn]посилання {link} не розкриваю — ціль перенесіть окремо[/warn]")
-    console.print(f"[muted]скопіювати: {T.human(p.copy_bytes)}"
-                  + (f", вільно: {T.human(p.free_bytes)}" if p.free_bytes >= 0 else "")
-                  + "[/muted]")
-    for w in p.warnings:
-        console.print(f"[warn]⚠ {w}[/warn]")
+    console.print(f"простір:  {p.workspace} → [bold]{p.target}[/bold]  "
+                  + (f"[muted](справи: {', '.join(p.cases)})[/muted]  " if p.cases else "")
+                  + f"[muted]{R.human(p.workspace_bytes)}[/muted]")
+    for root, d in p.roots:
+        state = (f"→ {d}" if d else
+                 "[warn]теки немає[/warn]" if not root.is_dir() else
+                 "[warn]не переноситься[/warn] [muted](--with-roots)[/muted]")
+        console.print(f"корінь:   {root}  {state}")
+    if p.data_from is not None:
+        console.print(f"довідники: {p.data_from}  [muted]{R.human(p.data_bytes)}[/muted]")
+    if p.free_bytes >= 0:
+        console.print(f"[muted]вільно на диску: {R.human(p.free_bytes)}, усього в копії ≈ "
+                      f"{R.human(p.total_bytes)}[/muted]")
     for problem in p.problems:
         console.print(f"[err]✗ {problem}[/err]")
     if p.problems:
@@ -1066,56 +1020,53 @@ def workspace_export(
         console.print("[muted]це --dry-run: нічого не зроблено[/muted]")
         return
     try:
-        with _transfer_progress() as (echo, progress):
-            T.run_export(p, echo=echo, progress=progress)
+        T.run_export(p, echo=console.print)
     except T.TransferError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=1) from None
-    console.print(f"\n✅ пакунок готовий: {p.dest}")
-    console.print(f"[bold]Далі:[/bold] на новій машині — `nysh workspace import {p.dest}`")
+    console.print(f"\n✅ копія готова: {p.target}")
+    console.print("[muted]на іншій машині: поставте Нишпорку й виконайте "
+                  f"`nysh workspace import \"{p.target}\"`[/muted]")
 
 
 @workspace_app.command("import")
 @route("workspace import", tier="rare", mutates=True,
-       when="людина принесла пакунок простору з іншого комп'ютера")
-def workspace_import(
-    bundle: str = typer.Argument(..., help="тека пакунка (`nysh workspace export`)"),
-    target: str = typer.Argument("", help="куди розкласти простір; типово — поруч "
-                                          "із документами, під іменем старої теки"),
+       when="розгорнути дослідження з копії, зробленої на іншій машині")
+def workspace_import_cmd(
+    source: str = typer.Argument(..., help="тека копії (там лежить nyshporka-bundle.json)"),
+    dest: str = typer.Argument("", help="куди розгорнути простір; порожньо — тека за замовчуванням"),
     roots_to: str = typer.Option("", "--roots-to",
-                                 help="куди класти корені справ із пакунка "
-                                      "(типово `<тека>-справи` поруч із простором)"),
+                                 help="куди покласти теки зі сканами з копії"),
     update: bool = typer.Option(False, "--update",
                                 help="долити зміни в наявний простір (не затираючи решту)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="лише показати план"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="не питати"),
 ) -> None:
-    """Розкласти пакунок простору на цій машині й налаштувати його під неї.
+    """Розгорнути простір із копії `nysh workspace export` на цій машині.
 
-    Корені справ переписуються на нові місця, хук git — на цей інтерпретатор,
-    простір стає активним. Пакунок не змінюється.
+    Копія звіряється з переліком у паспорті, корені справ переписуються на
+    нові місця, хук канону — на інтерпретатор цієї машини. Наприкінці —
+    реєстр справ, `nysh doctor` і що лишилось зробити руками.
     """
     from nyshporka.core.workspace import WorkspaceError
     from nyshporka.setup import transfer as T
 
     try:
-        with _transfer_progress(muted=True) as (echo, progress):
-            p = T.plan_import(bundle, target or None, roots_to or None,
-                              update=update, echo=echo, progress=progress)
-    except (T.TransferError, WorkspaceError) as exc:
+        p = T.plan_import(source, dest or None, roots_to=roots_to or None, update=update)
+    except (WorkspaceError, T.TransferError) as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=2) from None
-    meta = p.meta
-    src = meta.get("source") or {}
-    console.print(f"пакунок:  {p.bundle}  [muted]Нишпорка {meta.get('nysh_version')}, "
-                  f"{meta.get('created_at')}, з {src.get('workspace')}[/muted]")
-    console.print(f"простір:  [bold]{p.target}[/bold]  [muted]{T.human(p.need_bytes)}[/muted]")
-    for r in p.roots:
-        if r.get("slot"):
-            console.print(f"корінь:   {r['path']} → {p.roots_to / str(r['slot']).split('/', 1)[1]}")
-        elif not r.get("inside"):
-            console.print(f"[warn]корінь:   {r['path']} — у пакунку немає[/warn]")
-    for w in p.warnings:
-        console.print(f"[warn]⚠ {w}[/warn]")
+    b = p.bundle
+    console.print(f"копія:    {p.source}  [muted]Нишпорка {b.get('nyshporka')}, "
+                  f"{b.get('platform')}, {b.get('created')}[/muted]")
+    console.print(f"простір:  → [bold]{p.dest}[/bold]")
+    labels = {"keep": "лишається на місці", "copy": "з копії →",
+              "missing": "[warn]немає ні тут, ні в копії[/warn]"}
+    for m in p.roots:
+        tail = f" {m.new}" if m.action == "copy" else ""
+        console.print(f"корінь:   {m.original}  {labels[m.action]}{tail}")
+    for part in p.data_parts:
+        console.print(f"довідники: {part} з копії")
     for problem in p.problems:
         console.print(f"[err]✗ {problem}[/err]")
     if p.problems:
@@ -1123,28 +1074,17 @@ def workspace_import(
     if dry_run:
         console.print("[muted]це --dry-run: нічого не зроблено[/muted]")
         return
+    if not yes and not typer.confirm("Розгортаємо?", default=True):
+        raise typer.Exit(code=1)
     try:
-        with _transfer_progress() as (echo, progress):
-            rep = T.run_import(p, echo=echo, progress=progress)
+        todo = T.run_import(p, echo=console.print)
     except T.TransferError as exc:
         console.print(f"[err]{exc}[/err]")
         raise typer.Exit(code=1) from None
-    console.print(f"\n✅ простір перенесено й відкрито: {rep.target}")
-    if rep.moved_aside:
-        console.print(f"[muted]порожній простір від встановлення: {rep.moved_aside} — "
-                      f"можна видалити[/muted]")
-    for old, new in rep.roots_moved.items():
-        console.print(f"корінь {old} → {new}")
-    for name, where in {**rep.data, **rep.memory}.items():
-        console.print(f"[muted]{name}: {where}[/muted]")
-    if rep.git_hook:
-        console.print(f"[muted]хук git → {rep.git_hook}[/muted]")
-    if rep.cases:
-        console.print(f"[muted]{rep.cases}[/muted]")
-    if rep.todo:
-        console.print("[bold]Лишилось зробити руками:[/bold]")
-        for item in rep.todo:
-            console.print(f"  • {item}")
+    console.print(f"\n✅ простір розгорнуто: {p.dest}")
+    console.print("[bold]Лишилось на цій машині:[/bold]")
+    for item in todo:
+        console.print(f"  • {item}")
 
 
 def _catalog_step(*, check: bool, skip: bool) -> None:
